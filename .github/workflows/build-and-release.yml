@@ -42,9 +42,9 @@ jobs:
           # Move chromedriver.exe to the root directory where the .spec file expects it
           Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe" -Force
 
-      # Build one-file EXE and bundle chromedriver.exe into sys._MEIPASS
-      - name: Build the executable (one-file)
-        run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
+      # Build one-dir distribution using spec (no embedded chromedriver)
+      - name: Build (one-dir)
+        run: pyinstaller WoonnetRijnmondBot.spec
 
       # Optional VirusTotal scan (requires VIRUSTOTAL_API_KEY secret)
       - name: VirusTotal Scan
@@ -161,12 +161,17 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Upload Release Asset
+      - name: Archive dist folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/WoonnetRijnmondBot/* -DestinationPath WoonnetRijnmondBot.zip
+
+      - name: Upload Release Asset (zip)
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/WoonnetRijnmondBot.exe
-          asset_name: WoonnetRijnmondBot.exe
-          asset_content_type: application/vnd.microsoft.portable-executable
+          asset_path: ./WoonnetRijnmondBot.zip
+          asset_name: WoonnetRijnmondBot.zip
+          asset_content_type: application/zip

@@ -85,9 +85,37 @@ class WoonnetClient:
         if enable_browser:
             try:
                 if getattr(sys, 'frozen', False):
-                    driver_path = os.path.join(sys._MEIPASS, "chromedriver.exe")  # type: ignore
+                    # Expect chromedriver.exe adjacent to the executable (one-dir build) or in _MEIPASS fallback.
+                    base_dir = os.path.dirname(sys.executable)
+                    candidate_paths = [
+                        os.path.join(base_dir, 'chromedriver.exe'),
+                        os.path.join(getattr(sys, '_MEIPASS', base_dir), 'chromedriver.exe')  # type: ignore
+                    ]
+                    driver_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+                    if not driver_path:
+                        # Attempt on-demand download (small fallback) – only if network available.
+                        try:
+                            import urllib.request, zipfile, io, json as _json
+                            self._log("Chromedriver not bundled; attempting runtime download of latest stable...")
+                            meta_url = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+                            with urllib.request.urlopen(meta_url, timeout=15) as r:
+                                meta = _json.loads(r.read().decode())
+                            dl = next(d for d in meta['channels']['Stable']['downloads']['chromedriver'] if d['platform'] == 'win64')
+                            with urllib.request.urlopen(dl['url'], timeout=30) as r:
+                                zbytes = r.read()
+                            with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
+                                member = next(m for m in zf.namelist() if m.endswith('chromedriver.exe'))
+                                with open(os.path.join(base_dir, 'chromedriver.exe'), 'wb') as f:
+                                    f.write(zf.read(member))
+                            driver_path = os.path.join(base_dir, 'chromedriver.exe')
+                            self._log(f"Downloaded chromedriver to {driver_path}")
+                        except Exception as de:
+                            self._log(f"Failed to download chromedriver: {de}", 'error')
+                            driver_path = None
+                    if not driver_path:
+                        raise RuntimeError('Chromedriver executable not found.')
                     self.service = ChromeService(executable_path=driver_path)
-                    self._log(f"Bundle mode: Using chromedriver from {driver_path}")
+                    self._log(f"Runtime mode: Using chromedriver from {driver_path}")
                 else:
                     self._log("Script mode: Installing/updating chromedriver with webdriver-manager...")
                     self.service = ChromeService(ChromeDriverManager().install())  # type: ignore

@@ -5,9 +5,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('chromedriver.exe', '.'),
-        # NEW: Also bundle the assets folder
-        ('assets', 'assets')
+        ('assets', 'assets'),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -22,8 +20,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    # MODIFIED: Removed the empty list and exclude_binaries=True
-    # This ensures necessary binaries are included in the single file.
     a.binaries,
     a.zipfiles,
     a.datas,
@@ -31,13 +27,26 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/icon.ico'
+    icon='assets/icon.ico',
+    version='version_info.txt',
+    manifest='app.manifest'
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='WoonnetRijnmondBot'
 )
 
