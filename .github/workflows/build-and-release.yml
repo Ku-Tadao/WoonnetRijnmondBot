@@ -62,31 +62,28 @@ jobs:
           Write-Host "SHA256: $sha256"
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
 
-          function Get-File-Report {
-            param($sha256)
-            try {
-              return Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
-            } catch {
-              return $null
-            }
-          }
+          # Try to fetch existing report first
+          try {
+            $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
+          } catch { $report = $null }
 
-          $report = Get-File-Report -sha256 $sha256
           if (-not $report) {
             $fileSize = (Get-Item $exePath).Length
             if ($fileSize -gt 33554432) {
               Write-Host "File >32MB, requesting large file upload URL"
               $uploadUrlResp = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/upload_url" -Headers $headers
               $uploadUrl = $uploadUrlResp.data
-              $form = @{ file = Get-Item $exePath }
-              $upload = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -Form $form
+              Write-Host "Uploading via large file URL"
+              curl -s -X POST "$uploadUrl" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
             } else {
-              $form = @{ file = Get-Item $exePath }
-              $upload = Invoke-RestMethod -Method Post -Uri "https://www.virustotal.com/api/v3/files" -Headers $headers -Form $form
+              Write-Host "Standard upload (<32MB)"
+              curl -s -X POST "https://www.virustotal.com/api/v3/files" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
             }
+            if (-not (Test-Path upload.json)) { throw "Upload response missing" }
+            $upload = Get-Content upload.json | ConvertFrom-Json
             $analysisId = $upload.data.id
             Write-Host "Submitted for analysis: $analysisId"
-            $maxAttempts = 18  # ~3 minutes at 10s interval
+            $maxAttempts = 18
             for ($i=0; $i -lt $maxAttempts; $i++) {
               Start-Sleep -Seconds 10
               $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
@@ -94,7 +91,8 @@ jobs:
               Write-Host "Analysis status: $status ($($i+1)/$maxAttempts)"
               if ($status -eq 'completed') { break }
             }
-            $report = Get-File-Report -sha256 $sha256
+            # Retrieve final report after analysis
+            try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           }
 
           if (-not $report) { throw "Unable to retrieve VirusTotal report." }
@@ -102,8 +100,7 @@ jobs:
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
           $permalink = "https://www.virustotal.com/gui/file/$sha256"
           Write-Host $summary
-            Write-Host "Report URL: $permalink"
-          # Set step outputs
+          Write-Host "Report URL: $permalink"
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "permalink=$permalink" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
