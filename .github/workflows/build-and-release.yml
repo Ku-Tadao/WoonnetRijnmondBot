@@ -101,9 +101,46 @@ jobs:
           $permalink = "https://www.virustotal.com/gui/file/$sha256"
           Write-Host $summary
           Write-Host "Report URL: $permalink"
+          # Build detailed flagged engines list & ratio
+          $results = $report.data.attributes.last_analysis_results
+          $allEngines = $results.PSObject.Properties.Name
+          $flagged = @()
+          foreach ($engineKey in $allEngines) {
+            $entry = $results.$engineKey
+            if ($entry.category -in 'malicious','suspicious') {
+              $flagged += [PSCustomObject]@{engine=$entry.engine_name; category=$entry.category; result=$entry.result}
+            }
+          }
+          $flaggedCount = $flagged.Count
+          $totalEngines = $allEngines.Count
+          $ratio = "$flaggedCount/$totalEngines"
+          Write-Host "Detection ratio: $ratio"
+          # Create markdown table
+          $md = "# VirusTotal Report\n\nSHA256: $sha256\n\nSummary: $summary\n\nDetection ratio: $ratio\nReport URL: $permalink\n\n## Flagged Engines (malicious/suspicious)\n"
+          if ($flaggedCount -gt 0) {
+            $md += "| Engine | Category | Result |`n|---|---|---|`n"
+            foreach ($f in $flagged) { $md += "| $($f.engine) | $($f.category) | $($f.result) |`n" }
+          } else {
+            $md += "None flagged.\n"
+          }
+          # Save artifacts
+          $report | ConvertTo-Json -Depth 10 | Out-File vt_report.json -Encoding UTF8
+          $md | Out-File vt_report.md -Encoding UTF8
+          # Outputs
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "permalink=$permalink" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "ratio=$ratio" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          if ($flaggedCount -gt 0) { "flagged_engines=$([string]::Join(',', ($flagged.engine)))" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append }
+
+      - name: Upload VirusTotal artifacts
+        if: steps.vt_scan.outputs.sha256
+        uses: actions/upload-artifact@v4
+        with:
+          name: virustotal-report
+          path: |
+            vt_report.json
+            vt_report.md
 
       - name: Create GitHub Release
         id: create_release
@@ -119,6 +156,8 @@ jobs:
             SHA256: ${{ steps.vt_scan.outputs.sha256 }}
             ${{ steps.vt_scan.outputs.summary }}
             Report: ${{ steps.vt_scan.outputs.permalink }}
+            Detection Ratio: ${{ steps.vt_scan.outputs.ratio }}
+            Flagged Engines: ${{ steps.vt_scan.outputs.flagged_engines }}
           draft: false
           prerelease: false
 
