@@ -46,6 +46,68 @@ jobs:
       - name: Build the executable (one-file)
         run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
 
+      # Optional VirusTotal scan (requires VIRUSTOTAL_API_KEY secret)
+      - name: VirusTotal Scan
+        id: vt_scan
+        shell: pwsh
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          if (-not $Env:VT_API_KEY) { Write-Host 'No VirusTotal API key provided. Skipping scan.'; exit 0 }
+          $ErrorActionPreference = 'Stop'
+          $exePath = "dist/WoonnetRijnmondBot.exe"
+          if (-not (Test-Path $exePath)) { throw "Executable not found at $exePath" }
+          $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
+          $sha256 = $hashObj.Hash.ToLower()
+          Write-Host "SHA256: $sha256"
+          $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
+
+          function Get-File-Report {
+            param($sha256)
+            try {
+              return Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
+            } catch {
+              return $null
+            }
+          }
+
+          $report = Get-File-Report -sha256 $sha256
+          if (-not $report) {
+            $fileSize = (Get-Item $exePath).Length
+            if ($fileSize -gt 33554432) {
+              Write-Host "File >32MB, requesting large file upload URL"
+              $uploadUrlResp = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/upload_url" -Headers $headers
+              $uploadUrl = $uploadUrlResp.data
+              $form = @{ file = Get-Item $exePath }
+              $upload = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -Form $form
+            } else {
+              $form = @{ file = Get-Item $exePath }
+              $upload = Invoke-RestMethod -Method Post -Uri "https://www.virustotal.com/api/v3/files" -Headers $headers -Form $form
+            }
+            $analysisId = $upload.data.id
+            Write-Host "Submitted for analysis: $analysisId"
+            $maxAttempts = 18  # ~3 minutes at 10s interval
+            for ($i=0; $i -lt $maxAttempts; $i++) {
+              Start-Sleep -Seconds 10
+              $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
+              $status = $analysis.data.attributes.status
+              Write-Host "Analysis status: $status ($($i+1)/$maxAttempts)"
+              if ($status -eq 'completed') { break }
+            }
+            $report = Get-File-Report -sha256 $sha256
+          }
+
+          if (-not $report) { throw "Unable to retrieve VirusTotal report." }
+          $stats = $report.data.attributes.last_analysis_stats
+          $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
+          $permalink = "https://www.virustotal.com/gui/file/$sha256"
+          Write-Host $summary
+            Write-Host "Report URL: $permalink"
+          # Set step outputs
+          "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "permalink=$permalink" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
@@ -57,6 +119,9 @@ jobs:
           body: |
             Automated release for commit ${{ github.sha }}.
             This build includes the WoonnetRijnmondBot application.
+            SHA256: ${{ steps.vt_scan.outputs.sha256 }}
+            ${{ steps.vt_scan.outputs.summary }}
+            Report: ${{ steps.vt_scan.outputs.permalink }}
           draft: false
           prerelease: false
 
