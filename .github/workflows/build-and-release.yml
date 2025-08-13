@@ -61,6 +61,8 @@ jobs:
           $sha256 = $hashObj.Hash.ToLower()
           Write-Host "SHA256: $sha256"
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
+          $allowMalicious = @('Bkav','APEX','Jiangmin')  # known benign FPs
+          $maxUnexpectedMalicious = 0
 
           # Try to fetch existing report first
           try {
@@ -115,6 +117,22 @@ jobs:
           $totalEngines = $allEngines.Count
           $ratio = "$flaggedCount/$totalEngines"
           Write-Host "Detection ratio: $ratio"
+          # Extended relationships (YARA / Sigma)
+          try {
+            $ext = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256?relationships=crowdsourced_yara_results,sigma_analysis_results" -Headers $headers -ErrorAction Stop
+          } catch { $ext = $null }
+          $yara = @(); $sigma = @()
+          if ($ext) {
+            if ($ext.data.attributes.crowdsourced_yara_results) { $yara = $ext.data.attributes.crowdsourced_yara_results }
+            if ($ext.data.attributes.sigma_analysis_results) { $sigma = $ext.data.attributes.sigma_analysis_results }
+          }
+          $yaraSummary = if ($yara.Count -gt 0) { $yara | ForEach-Object { "- $($_.rule_name): $($_.description)" } } else { @('None') }
+          $sigmaSummary = if ($sigma.Count -gt 0) { $sigma | ForEach-Object { "- $($_.rule_title) ($($_.level))" } } else { @('None') }
+          # Allowlist enforcement
+          $unexpected = $flagged | Where-Object { $_.category -eq 'malicious' -and ($allowMalicious -notcontains $_.engine) }
+          if ($unexpected.Count -gt $maxUnexpectedMalicious) {
+            Write-Host "::error ::Unexpected malicious engines: $($unexpected.engine -join ', ')" 
+          }
           # Create markdown table
           $md = "# VirusTotal Report\n\nSHA256: $sha256\n\nSummary: $summary\n\nDetection ratio: $ratio\nReport URL: $permalink\n\n## Flagged Engines (malicious/suspicious)\n"
           if ($flaggedCount -gt 0) {
@@ -123,15 +141,19 @@ jobs:
           } else {
             $md += "None flagged.\n"
           }
-          # Save artifacts
+          $md += "\n## YARA Matches\n" + ($yaraSummary -join "`n") + "\n\n## Sigma Matches\n" + ($sigmaSummary -join "`n") + "\n"
+          # Save artifacts & false positives doc
           $report | ConvertTo-Json -Depth 10 | Out-File vt_report.json -Encoding UTF8
           $md | Out-File vt_report.md -Encoding UTF8
+          $falsePos = "# FALSE_POSITIVES\n\nAllowlisted malicious engines: " + ($allowMalicious -join ', ') + "\nUnexpected malicious (should be none): " + (if ($unexpected.Count -gt 0) { ($unexpected.engine -join ', ') } else { 'None' }) + "\n"
+          $falsePos | Out-File FALSE_POSITIVES.md -Encoding UTF8
           # Outputs
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "permalink=$permalink" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "ratio=$ratio" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           if ($flaggedCount -gt 0) { "flagged_engines=$([string]::Join(',', ($flagged.engine)))" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append }
+          if ($unexpected.Count -gt 0) { "unexpected_malicious=$([string]::Join(',', ($unexpected.engine)))" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append }
 
       - name: Upload VirusTotal artifacts
         if: steps.vt_scan.outputs.sha256
