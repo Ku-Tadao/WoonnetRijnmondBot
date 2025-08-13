@@ -1,7 +1,7 @@
 # WoonnetRijnmondBot.spec
 
 a = Analysis(
-    ['hybrid_bot.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[

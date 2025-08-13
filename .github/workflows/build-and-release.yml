@@ -44,7 +44,7 @@ jobs:
 
       # Build one-file EXE and bundle chromedriver.exe into sys._MEIPASS
       - name: Build the executable (one-file)
-        run: pyinstaller -F hybrid_bot.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;."
+        run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
 
       - name: Create GitHub Release
         id: create_release

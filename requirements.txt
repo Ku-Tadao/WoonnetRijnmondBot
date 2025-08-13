@@ -12,3 +12,4 @@ keyring
 
 # Selenium Driver Management (for local development)
 webdriver-manager
+pytest
