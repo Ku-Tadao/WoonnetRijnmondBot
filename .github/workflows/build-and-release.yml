@@ -55,8 +55,13 @@ jobs:
         run: |
           if (-not $Env:VT_API_KEY) { Write-Host 'No VirusTotal API key provided. Skipping scan.'; exit 0 }
           $ErrorActionPreference = 'Stop'
-          $exePath = "dist/WoonnetRijnmondBot.exe"
-          if (-not (Test-Path $exePath)) { throw "Executable not found at $exePath" }
+          # Locate executable (support one-dir or legacy one-file path)
+          $exeCandidates = @(
+            "dist/WoonnetRijnmondBot/WoonnetRijnmondBot.exe",
+            "dist/WoonnetRijnmondBot.exe"
+          )
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exePath) { throw "Executable not found in candidates: $($exeCandidates -join ', ')" }
           $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
           $sha256 = $hashObj.Hash.ToLower()
           Write-Host "SHA256: $sha256"
@@ -145,7 +150,8 @@ jobs:
           # Save artifacts & false positives doc
           $report | ConvertTo-Json -Depth 10 | Out-File vt_report.json -Encoding UTF8
           $md | Out-File vt_report.md -Encoding UTF8
-          $falsePos = "# FALSE_POSITIVES\n\nAllowlisted malicious engines: " + ($allowMalicious -join ', ') + "\nUnexpected malicious (should be none): " + (if ($unexpected.Count -gt 0) { ($unexpected.engine -join ', ') } else { 'None' }) + "\n"
+          $unexpectedList = if ($unexpected.Count -gt 0) { ($unexpected.engine -join ', ') } else { 'None' }
+          $falsePos = "# FALSE_POSITIVES\n\nAllowlisted malicious engines: " + ($allowMalicious -join ', ') + "\nUnexpected malicious (should be none): $unexpectedList\n"
           $falsePos | Out-File FALSE_POSITIVES.md -Encoding UTF8
           # Outputs
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
