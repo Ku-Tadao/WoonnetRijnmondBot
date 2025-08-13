@@ -3,7 +3,7 @@
 """ WoonnetBot Core Logic ... """
 
 import time, re, sys, os, threading, requests, logging
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import Queue
 from typing import List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +14,7 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException
+from urllib.parse import urljoin
 
 # Only import webdriver_manager if not running as a frozen executable
 if not getattr(sys, 'frozen', False):
@@ -84,7 +85,10 @@ class WoonnetBot:
         options.add_argument("--disable-gpu")
         options.add_argument("--log-level=3")
         options.add_argument(f"user-agent={USER_AGENT}") # NEW: Use consistent user agent
-        options.add_experimental_option('excludeSwitches', ['enable-logging']) # Suppress console noise
+        # Stealth-ish flags
+        options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument("--disable-blink-features=AutomationControlled")
 
         try:
             self.driver = webdriver.Chrome(service=self.service, options=options)
@@ -105,11 +109,20 @@ class WoonnetBot:
             WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(USERNAME_FIELD_SELECTOR)).send_keys(username)
             self.driver.find_element(*PASSWORD_FIELD_SELECTOR).send_keys(password)
             WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(LOGIN_BUTTON_SELECTOR)).click()
-            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(LOGOUT_LINK_SELECTOR))
+            # Consider login successful if logout appears OR URL changes away from the login page
+            WebDriverWait(self.driver, 15).until(lambda d: d.find_elements(*LOGOUT_LINK_SELECTOR) or ("inloggen" not in d.current_url.lower()))
             self._log("Login successful.")
 
-            for cookie in self.driver.get_cookies():
-                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+            # Copy cookies into requests (domain + path)
+            self.session.cookies.clear()
+            for c in self.driver.get_cookies():
+                if c.get('name'):
+                    self.session.cookies.set(
+                        c['name'], c.get('value',''),
+                        domain=c.get('domain'),
+                        path=c.get('path','/')
+                    )
+
 
             self.session.headers.update({
                 'User-Agent': USER_AGENT,
@@ -117,6 +130,13 @@ class WoonnetBot:
                 'X-Requested-With': 'XMLHttpRequest',
                 'Referer': DISCOVERY_URL
             })
+            # Optional server-side verification of logged-in state
+            try:
+                probe = self.session.get(BASE_URL, timeout=10)
+                if ("Uitloggen" not in probe.text) and ("Mijn Woonnet" not in probe.text):
+                    self._log("Warning: Could not verify login via HTML markers.", "warning")
+            except Exception:
+                pass
             self.is_logged_in = True
             return True, self.session
         except Exception as e:
@@ -145,6 +165,50 @@ class WoonnetBot:
         except (KeyError, ValueError, TypeError) as e:
             self._log(f"API Error (Timer): Could not parse server response. {e}", "error")
             return None
+
+    def _extract_postable_form(self, html: str, base_url: str) -> tuple[str | None, dict]:
+        """Find a likely application form, build a payload with inputs/checkboxes/radios/selects/textareas, and resolve action URL."""
+        soup = BeautifulSoup(html, 'html.parser')
+        forms = [f for f in soup.find_all('form')
+                 if f.find('input', {'name': '__RequestVerificationToken'})] or soup.find_all('form')
+        if not forms:
+            return None, {}
+        form = forms[0]
+        payload: dict[str, str] = {}
+        # Inputs
+        for inp in form.find_all('input'):
+            name = inp.get('name')
+            if not name or inp.has_attr('disabled'):
+                continue
+            itype = (inp.get('type') or 'text').lower()
+            if itype in ('checkbox', 'radio'):
+                if inp.has_attr('checked'):
+                    payload[name] = inp.get('value', 'on')
+            else:
+                payload[name] = inp.get('value', '')
+        # Selects
+        for sel in form.find_all('select'):
+            name = sel.get('name')
+            if not name:
+                continue
+            opt = sel.find('option', selected=True) or sel.find('option')
+            if opt:
+                payload[name] = opt.get('value') or (opt.text or '').strip()
+        # Textareas
+        for ta in form.find_all('textarea'):
+            name = ta.get('name')
+            if name:
+                payload[name] = (ta.text or '').strip()
+        # Submit fallback
+        if 'Command' not in payload:
+            submit = (form.find('button', {'type': 'submit'}) or
+                      form.find('button', {'name': 'Command'}) or
+                      form.find('input', {'type': 'submit'}))
+            if submit:
+                payload[submit.get('name') or 'Command'] = submit.get('value') or (submit.text or '').strip()
+        action = form.get('action') or base_url
+        action_url = urljoin(base_url, action)
+        return action_url, payload
 
     def apply_to_listings(self, listing_ids: List[str]):
         """ Applies to a list of properties by sending direct POST requests in parallel. """
@@ -181,27 +245,23 @@ class WoonnetBot:
             apply_url = f"{BASE_URL}/reageren/{listing_id}"
             try:
                 page_res = self.session.get(apply_url, timeout=15)
-                soup = BeautifulSoup(page_res.text, 'html.parser')
-                
-                form_button = soup.find('button', {'name': 'Command', 'value': 'plaats-einkomen'})
-                if not form_button or not (form_element := form_button.find_parent('form')):
-                    self._log(f"({listing_id}) FAILED: Application form not found.", 'error')
+                action_url, payload = self._extract_postable_form(page_res.text, apply_url)
+                if not action_url or '__RequestVerificationToken' not in payload:
+                    self._log(f"({listing_id}) FAILED: Could not find postable form/token.", 'error')
                     return False
-
-                payload = {tag.get('name'): tag.get('value', '') for tag in form_element.find_all('input') if tag.get('name')}
-                payload['Command'] = 'plaats-einkomen'
-
-                if '__RequestVerificationToken' not in payload:
-                    self._log(f"({listing_id}) FAILED: Security token not found.", 'error')
-                    return False
-
-                submit_res = self.session.post(apply_url, data=payload, headers={'Referer': apply_url})
-                
-                if "Wij hebben uw reactie verwerkt" in submit_res.text or "U heeft al gereageerd" in submit_res.text:
+                submit_res = self.session.post(
+                    action_url, data=payload,
+                    headers={'Referer': apply_url},
+                    timeout=15, allow_redirects=True
+                )
+                text = submit_res.text
+                if any(s in text for s in ("Wij hebben uw reactie verwerkt",
+                                            "U heeft al gereageerd",
+                                            "Uw reactie is ontvangen")):
                     self._log(f"SUCCESS! Applied to listing {listing_id}.", 'info')
                     return True
                 else:
-                    self._log(f"({listing_id}) FAILED: Success message not found in response. Response text: {submit_res.text[:200]}...", 'error')
+                    self._log(f"({listing_id}) FAILED: No success message. Snippet: {text[:300]}...", 'error')
                     return False
             except Exception as e:
                 # NEW: Report errors from within the application thread
@@ -236,10 +296,28 @@ class WoonnetBot:
         return float(re.sub(r'[^\d,]', '', price_text).replace(',', '.'))
 
     def _parse_publ_date(self, date_str: str | None) -> datetime | None:
-        """Utility to parse a publication date string into a datetime object."""
-        if not date_str: return None
-        try: return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
-        except (ValueError, TypeError): return None
+        """Parse publication date: supports /Date(…)/, ISO-8601 (with Z), and legacy string."""
+        if not date_str:
+            return None
+        # /Date(1692052500000)/
+        m = re.search(r'/Date\((\d+)\)/', date_str)
+        if m:
+            try:
+                return datetime.fromtimestamp(int(m.group(1)) / 1000.0)
+            except Exception:
+                return None
+        # ISO-8601 (possibly with Z)
+        try:
+            s = date_str.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(s)
+            return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+        except Exception:
+            pass
+        # Fallback legacy format
+        try:
+            return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
+        except Exception:
+            return None
 
     def discover_listings_api(self) -> List[Dict[str, Any]]:
         """ Discovers new listings for the day using the website's internal API. """
@@ -248,16 +326,24 @@ class WoonnetBot:
             return []
         self._log("Discovering listings via API...")
         try:
-            payload = {"woonwens": {"Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")}, "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag"}
+            payload = {
+                "woonwens": {
+                    "Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}],
+                    "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")
+                },
+                "paginaNummer": 1,
+                "paginaGrootte": 100,
+                "filterMode": "AlleenNieuwVandaag"
+            }
             response = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15)
             response.raise_for_status()
-            data = response.json() # Keep data for debugging
-            results = data.get('d', {}).get('resultaten', [])
-            if not results:
+            data = response.json()
+            initial_listings = data.get('d', {}).get('resultaten', [])
+
+            if not initial_listings:
                 self._log("API returned no new listings.")
                 return []
-            listing_ids = [str(r['FrontendAdvertentieId']) for r in results if r.get('FrontendAdvertentieId')]
-            self._log(f"Found {len(listing_ids)} IDs. Fetching details concurrently...")
+            self._log(f"Found {len(initial_listings)} IDs. Fetching details concurrently...")
         except Exception as e:
             # NEW: Report API discovery errors
             self._report_error(e, "during API listing discovery")
@@ -265,7 +351,7 @@ class WoonnetBot:
 
         processed_listings = []
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_id = {executor.submit(self.get_listing_details, lid): lid for lid in listing_ids}
+            future_to_id = {executor.submit(self.get_listing_details, r['FrontendAdvertentieId']): r['FrontendAdvertentieId'] for r in initial_listings if r.get('FrontendAdvertentieId')}
             for future in as_completed(future_to_id):
                 try: # NEW: Add try/except block here too
                     item = future.result()

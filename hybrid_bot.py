@@ -8,7 +8,8 @@ from typing import Dict, Any
 from datetime import datetime
 
 import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
+from ttkbootstrap.constants import (DANGER, DISABLED, EW, NORMAL, NSEW, SUCCESS,
+                                  WARNING, W, X)
 from ttkbootstrap.scrolled import ScrolledFrame
 from tkinter import messagebox, PhotoImage
 from PIL import Image, ImageTk, ImageDraw

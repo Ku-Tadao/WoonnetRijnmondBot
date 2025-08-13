@@ -42,9 +42,9 @@ jobs:
           # Move chromedriver.exe to the root directory where the .spec file expects it
           Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe" -Force
 
-      # MODIFIED: Build using the spec file for consistency
-      - name: Build the executable from .spec file
-        run: pyinstaller WoonnetRijnmondBot.spec
+      # Build one-file EXE and bundle chromedriver.exe into sys._MEIPASS
+      - name: Build the executable (one-file)
+        run: pyinstaller -F hybrid_bot.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;."
 
       - name: Create GitHub Release
         id: create_release

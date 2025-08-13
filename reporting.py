@@ -10,12 +10,12 @@ from typing import Optional
 # Replace this with the public URL Vercel gave you.
 REPORTING_PROXY_URL = 'https://woonnet-error-proxy.vercel.app/api' # <-- IMPORTANT: CHANGE THIS
 APP_VERSION = "3.4-secure" # Let's version the app
-
+    
 def send_discord_report(exception: Exception, context: str, log_file_path: Optional[str] = None):
     """
     Sends a detailed, formatted error report to Discord via a secure proxy.
     """
-    if not REPORTING_PROXY_URL or "woonnet-error-proxy" in REPORTING_PROXY_URL:
+    if not REPORTING_PROXY_URL:
         print("WARNING: Reporting proxy URL is not configured in reporting.py. Cannot send error report.")
         return
 
