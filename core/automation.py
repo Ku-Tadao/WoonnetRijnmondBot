@@ -9,10 +9,12 @@ from __future__ import annotations
 import os, sys, time, re, json, threading, logging, requests
 from datetime import datetime, timezone
 from queue import Queue
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
+from bs4.element import Tag
+from typing import cast
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
@@ -34,15 +36,32 @@ if not getattr(sys, 'frozen', False):  # only import manager when not frozen
 class WoonnetClient:
     """Automates interaction with WoonnetRijnmond website (login, discover, apply).
 
-    Parameters:
-        status_queue: Queue for pushing user-friendly status messages.
-        logger: Python logger instance.
-        log_file_path: Path to active log file for inclusion in reports.
-        enable_browser: When False, skip all Selenium / driver initialization (useful for
-            unit tests where only parsing / HTTP logic is exercised).
-            Can also be forced off by environment variable WOONNET_NO_BROWSER=1.
+    This class encapsulates all network / browser side-effects so the rest of the
+    application (UI, tests) can treat it as a service.
+
+    Parameters
+    ----------
+    status_queue : Queue
+        Destination for user-friendly log / status messages (e.g. UI thread).
+    logger : logging.Logger
+        Structured logger for file / console output.
+    log_file_path : str
+        Path to primary rolling log file (attached to Discord reports).
+    enable_browser : bool, default True
+        Skip Selenium initialization when False (or when env var WOONNET_NO_BROWSER=1).
+        This is critical for fast CI/unit tests that only exercise parsing / HTTP logic.
+    max_workers : int, default 10
+        Thread pool size for parallel detail fetching & application submission.
     """
-    def __init__(self, status_queue: Queue, logger: logging.Logger, log_file_path: str, *, enable_browser: bool = True):
+    def __init__(
+        self,
+        status_queue: Queue,
+        logger: logging.Logger,
+        log_file_path: str,
+        *,
+        enable_browser: bool = True,
+        max_workers: int = 10,
+    ) -> None:
         self.driver = None  # webdriver.Chrome | None
         self.status_queue = status_queue
         self.logger = logger
@@ -57,6 +76,7 @@ class WoonnetClient:
         self._empty_runs = 0
         self.cache_path = None
         self._orig_request_func = None
+        self.max_workers = max(1, max_workers)
         # Respect env override
         if os.environ.get("WOONNET_NO_BROWSER") == "1":
             enable_browser = False
@@ -77,16 +97,16 @@ class WoonnetClient:
                 self.service = None  # type: ignore
 
     # --- Logging helpers ---
-    def _log(self, message: str, level: str = 'info'):
+    def _log(self, message: str, level: str = 'info') -> None:
         self.status_queue.put_nowait(message)
         getattr(self.logger, level, self.logger.info)(message)
 
-    def _report_error(self, e: Exception, context: str):
+    def _report_error(self, e: Exception, context: str) -> None:
         self._log(f"ERROR [{context}]: {e}", 'error')
         threading.Thread(target=send_discord_report, args=(e, context, self.log_file_path), daemon=True).start()
 
     # --- Debug HTTP tracing ---
-    def _debug_patch_session(self):
+    def _debug_patch_session(self) -> None:
         if self._orig_request_func is not None:
             return
         self._orig_request_func = self.session.request
@@ -127,13 +147,13 @@ class WoonnetClient:
             return resp
         self.session.request = traced  # type: ignore
 
-    def _debug_unpatch_session(self):
+    def _debug_unpatch_session(self) -> None:
         if self._orig_request_func is not None:
             self.session.request = self._orig_request_func  # type: ignore
             self._orig_request_func = None
 
     # --- Browser Lifecycle ---
-    def start_headless_browser(self):
+    def start_headless_browser(self) -> None:
         if self.driver:
             self._log("Browser is already running.", 'warning'); return
         if not getattr(self, 'service', None):
@@ -157,7 +177,7 @@ class WoonnetClient:
             self.driver = None
 
     # --- Auth ---
-    def login(self, username, password) -> Tuple[bool, requests.Session | None]:
+    def login(self, username: str, password: str) -> Tuple[bool, Optional[requests.Session]]:
         if not self.driver:
             self._log("Browser not started.", 'error'); return False, None
         self._log(f"Attempting to log in as {username}...")
@@ -200,7 +220,7 @@ class WoonnetClient:
         if not price_text: return 0.0
         return float(re.sub(r'[^\d,]', '', price_text).replace(',', '.'))
 
-    def _parse_publ_date(self, date_str: str | None):
+    def _parse_publ_date(self, date_str: Optional[str]) -> Optional[datetime]:
         if not date_str: return None
         m = re.search(r'/Date\((\d+)\)/', date_str)
         if m:
@@ -251,20 +271,23 @@ class WoonnetClient:
         except Exception as e:
             self._report_error(e, "during API listing discovery")
             return []
-
         processed: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # Allow user-configurable thread pool size for experimentation / tuning.
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_id = {executor.submit(self.get_listing_details, r['FrontendAdvertentieId']): r['FrontendAdvertentieId'] for r in initial_listings if r.get('FrontendAdvertentieId')}
             for future in as_completed(future_to_id):
                 try:
                     item = future.result()
-                    if not item: continue
-                    if self.debug: self._log(f"[DETAIL] Got detail for ID {item.get('id')} keys={list(item)[:15]}")
+                    if not item:
+                        continue
+                    if self.debug:
+                        self._log(f"[DETAIL] Got detail for ID {item.get('id')} keys={list(item)[:15]}")
                     now = datetime.now()
                     publ_start_dt = self._parse_publ_date(item.get('publstart'))
                     is_live = publ_start_dt and now >= publ_start_dt
                     is_in_window = now.hour >= APPLICATION_HOUR - 2
-                    if is_live: status_text = "LIVE"
+                    if is_live:
+                        status_text = "LIVE"
                     else:
                         start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else f"{APPLICATION_HOUR}:00"
                         status_text = f"SELECTABLE ({start_time_str})" if is_in_window else f"PREVIEW ({start_time_str})"
@@ -286,7 +309,7 @@ class WoonnetClient:
         self._log(f"Processed {len(processed)} listings.")
         return sorted(processed, key=lambda x: x['price_float'])
 
-    def get_listing_details(self, listing_id: str) -> Dict | None:
+    def get_listing_details(self, listing_id: str) -> Optional[Dict]:
         payload = {"Id": listing_id, "VolgendeId": 0, "Filters": "gebruik!=Complex|nieuwab==True", "inschrijfnummerTekst": "", "Volgorde": "", "hash": ""}
         try:
             response = self.session.post(API_DETAILS_SINGLE_URL, json=payload, timeout=10)
@@ -297,7 +320,7 @@ class WoonnetClient:
             return None
 
     # --- Apply Workflow ---
-    def _get_server_countdown_seconds(self) -> float | None:
+    def _get_server_countdown_seconds(self) -> Optional[float]:
         self._log("Fetching precise countdown from server API...")
         try:
             response = self.session.get(API_TIMER_URL, timeout=10)
@@ -312,7 +335,7 @@ class WoonnetClient:
             self._log(f"API Error (Timer): {e}", 'error')
             return None
 
-    def apply_to_listings(self, listing_ids: List[str]):
+    def apply_to_listings(self, listing_ids: Sequence[str]) -> None:
         if not self.is_logged_in or not self.session:
             self._log("Not logged in. Please log in before applying.", 'error'); return
         self._log("Waiting for the application window to open...")
@@ -350,43 +373,97 @@ class WoonnetClient:
             except Exception as e:
                 self._report_error(e, f"applying to listing ID {listing_id}")
                 return False
-
         success = 0
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(_apply_task, lid): lid for lid in listing_ids}
             for f in as_completed(futures):
-                if f.result(): success += 1
+                if f.result():
+                    success += 1
         self._log(f"Finished. Applied to {success} of {len(listing_ids)} selected listings.")
 
-    def _extract_postable_form(self, html: str, base_url: str) -> tuple[str | None, dict]:
+    def _extract_postable_form(self, html: str, base_url: str) -> Tuple[Optional[str], dict]:
+        """Extract a likely application form and construct payload.
+
+        Type-checker friendly: avoid using BeautifulSoup dynamic attributes directly
+        without casting; coerce attribute values to str.
+        """
         soup = BeautifulSoup(html, 'html.parser')
-        forms = [f for f in soup.find_all('form') if f.find('input', {'name': '__RequestVerificationToken'})] or soup.find_all('form')
-        if not forms: return None, {}
-        form = forms[0]; payload: dict[str, str] = {}
+        forms = list(soup.find_all('form'))
+        if not forms:
+            return None, {}
+        # Prefer a form containing the anti-forgery token
+        chosen: Optional[Tag] = None
+        for f in forms:
+            if isinstance(f, Tag) and f.find('input', {'name': '__RequestVerificationToken'}):
+                chosen = cast(Tag, f)
+                break
+        if chosen is None:
+            chosen = cast(Tag, forms[0])
+        form = chosen
+        payload: dict[str, str] = {}
+
+        def _as_str(val: object, default: str = '') -> str:
+            if isinstance(val, str):
+                return val
+            return default if val is None else str(val)
+
+        # Inputs
         for inp in form.find_all('input'):
-            name = inp.get('name');
-            if not name or inp.has_attr('disabled'): continue
-            itype = (inp.get('type') or 'text').lower()
-            if itype in ('checkbox','radio'):
-                if inp.has_attr('checked'): payload[name] = inp.get('value','on')
-            else: payload[name] = inp.get('value','')
+            if not isinstance(inp, Tag):
+                continue
+            name = _as_str(inp.get('name'))
+            if not name or inp.get('disabled') is not None:
+                continue
+            itype = _as_str(inp.get('type'), 'text').lower()
+            if itype in ('checkbox', 'radio'):
+                if inp.get('checked') is not None:
+                    payload[name] = _as_str(inp.get('value'), 'on') or 'on'
+            else:
+                payload[name] = _as_str(inp.get('value'))
+
+        # Selects
         for sel in form.find_all('select'):
-            name = sel.get('name');
-            if not name: continue
-            opt = sel.find('option', selected=True) or sel.find('option')
-            if opt: payload[name] = opt.get('value') or (opt.text or '').strip()
+            if not isinstance(sel, Tag):
+                continue
+            sel_name = _as_str(sel.get('name'))
+            if not sel_name:
+                continue
+            opt = sel.find('option', {'selected': True}) or sel.find('option')
+            if isinstance(opt, Tag):
+                payload[sel_name] = _as_str(opt.get('value')) or (opt.text or '').strip()
+
+        # Textareas
         for ta in form.find_all('textarea'):
-            name = ta.get('name');
-            if name: payload[name] = (ta.text or '').strip()
+            if not isinstance(ta, Tag):
+                continue
+            ta_name = _as_str(ta.get('name'))
+            if ta_name:
+                payload[ta_name] = (ta.text or '').strip()
+
+        # Submit / command fallback
         if 'Command' not in payload:
-            submit = (form.find('button', {'type':'submit'}) or form.find('button', {'name':'Command'}) or form.find('input', {'type':'submit'}))
-            if submit: payload[submit.get('name') or 'Command'] = submit.get('value') or (submit.text or '').strip()
-        action_url = urljoin(base_url, form.get('action') or base_url)
-        return action_url, payload
+            submit = (
+                form.find('button', {'type': 'submit'})
+                or form.find('button', {'name': 'Command'})
+                or form.find('input', {'type': 'submit'})
+            )
+            if isinstance(submit, Tag):
+                submit_name = _as_str(submit.get('name'), 'Command') or 'Command'
+                submit_val = _as_str(submit.get('value')) or (submit.text or '').strip()
+                payload[submit_name] = submit_val
+
+        action = _as_str(form.get('action')) or base_url
+        return urljoin(base_url, action), payload
 
     # --- Persistence ---
-    def set_cache_path(self, directory: str): self.cache_path = directory
-    def load_cached_ids(self):
+    def set_cache_path(self, directory: str) -> None:
+        """Define where ID cache persistence will read/write.
+
+        The file `last_ids.json` will be stored in this directory.
+        """
+        self.cache_path = directory
+
+    def load_cached_ids(self) -> None:
         if not self.cache_path: return
         fp = os.path.join(self.cache_path, 'last_ids.json')
         try:
@@ -397,15 +474,19 @@ class WoonnetClient:
                     self._log(f"Loaded {len(self._last_listing_ids)} cached IDs.")
         except Exception as e:
             self._log(f"Could not load cached ids: {e}", 'warning')
-    def _persist_ids(self):
+    def _persist_ids(self) -> None:
         if not self.cache_path: return
         fp = os.path.join(self.cache_path, 'last_ids.json')
         try:
             with open(fp,'w',encoding='utf-8') as f: json.dump(sorted(self._last_listing_ids), f)
         except Exception: pass
+    
+    def get_cached_listing_ids(self) -> List[str]:
+        """Return a snapshot list of the last discovered listing IDs (for tests / diagnostics)."""
+        return sorted(self._last_listing_ids)
 
     # --- Debug toggles ---
-    def set_debug(self, enabled: bool):
+    def set_debug(self, enabled: bool) -> None:
         self.debug = enabled
         if enabled:
             try: self._log(f"[DEBUG] Environment: pid={os.getpid()} python={sys.version.split()[0]} cwd={os.getcwd()}")
@@ -413,12 +494,12 @@ class WoonnetClient:
             self._debug_patch_session(); self._log("Debug mode ENABLED. HTTP tracing active.")
         else:
             self._debug_unpatch_session(); self._log("Debug mode disabled. HTTP tracing stopped.")
-    def set_http_body_trace(self, enabled: bool):
+    def set_http_body_trace(self, enabled: bool) -> None:
         self.trace_http_bodies = enabled
         self._log(f"HTTP body tracing {'ENABLED' if enabled else 'disabled'}.")
 
     # --- Shutdown ---
-    def quit(self):
+    def quit(self) -> None:
         self._log("Shutting down client...")
         self.stop_event.set()
         if self.driver:
