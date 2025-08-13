@@ -188,14 +188,23 @@ class WoonnetClient:
             self._log("Cannot start browser, ChromeService failed to initialize.", 'error'); return
         self._log("Starting browser...")
         options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--log-level=3")
-        options.add_argument(f"user-agent={USER_AGENT}")
-        options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
-        options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument("--disable-blink-features=AutomationControlled")
+        defender_safe = os.environ.get("DEFENDER_SAFE_MODE") == "1"
+        # Minimal set of flags in defender-safe mode to reduce heuristic triggers
+        if defender_safe:
+            options.add_argument("--headless")  # avoid "new" flavor
+            options.add_argument(f"user-agent={USER_AGENT}")
+        else:
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--log-level=3")
+            options.add_argument(f"user-agent={USER_AGENT}")
+            # The following anti-detection tweaks can elevate heuristic risk; omit when safe mode enabled
+            options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+            options.add_experimental_option('useAutomationExtension', False)
+            options.add_argument("--disable-blink-features=AutomationControlled")
+        if defender_safe:
+            self._log("DEFENDER_SAFE_MODE=1 active: using reduced Chrome flags.")
         try:
             self.driver = webdriver.Chrome(service=self.service, options=options)
             self._log("Browser started successfully.")
