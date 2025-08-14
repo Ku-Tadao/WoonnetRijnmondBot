@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QScrollArea, QFrame, QStatusBar, QMessageBox, QMenuBar, QMenu, QCheckBox,
     QGraphicsDropShadowEffect, QDialog, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, QThread, Slot, Signal, QTimer, QObject
+from PySide6.QtCore import Qt, QThread, Slot, Signal, QTimer, QObject, QAbstractAnimation
 from PySide6.QtGui import QColor, QPixmap, QImage, QMouseEvent, QIcon
 
 from core.automation import WoonnetClient
@@ -44,10 +44,12 @@ _IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 # Gallery cache now stores QImage objects (thread-safe to create) to avoid creating QPixmap off the GUI thread
 _GALLERY_CACHE: 'OrderedDict[str, QImage]' = OrderedDict()
 _GALLERY_CACHE_LIMIT = 200
+_GALLERY_CACHE_LOCK = threading.Lock()
 
 class ListingCard(QFrame):
     imageLoaded = Signal(QPixmap)
     imageError = Signal()
+    applyRequested = Signal(str)  # listing id
 
     _image_cache: 'OrderedDict[str, QPixmap]' = OrderedDict()
     _image_cache_limit = 100
@@ -56,11 +58,11 @@ class ListingCard(QFrame):
         super().__init__(parent)
         self.setObjectName("CardFrame")
         self.data = data
-        self._session = session  # reuse authenticated session (cookies, headers)
+        self._session = session
         self._img_label: QLabel | None = None
         self._shadow: QGraphicsDropShadowEffect | None = None
 
-        # Layout root
+        # Root row
         row = QHBoxLayout(self)
         row.setContentsMargins(14, 14, 14, 14)
         row.setSpacing(16)
@@ -68,7 +70,7 @@ class ListingCard(QFrame):
         # Image placeholder
         img_lbl = QLabel("IMG")
         img_lbl.setObjectName("cardImage")
-        img_lbl.setAlignment(Qt.AlignCenter)
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         img_lbl.setFixedSize(160, 120)
         row.addWidget(img_lbl)
         self._img_label = img_lbl
@@ -76,50 +78,70 @@ class ListingCard(QFrame):
         self.imageError.connect(self._mark_image_error)
         img_lbl.mousePressEvent = self._on_image_clicked  # type: ignore
 
-        # Middle content
-        mid = QVBoxLayout()
-        mid.setSpacing(6)
+        # Middle column
+        mid = QVBoxLayout(); mid.setSpacing(6)
         status_text = data.get('status_text', 'N/A')
         badge = QLabel(status_text)
-        st_upper = status_text.upper()
-        if 'LIVE' in st_upper:
-            badge.setObjectName('statusBadgeLive')
-        elif 'SELECTABLE' in st_upper:
-            badge.setObjectName('statusBadgeSelectable')
-        else:
-            badge.setObjectName('statusBadgePreview')
-        raw_addr = data.get('address', '').strip()
-        addr = QLabel(); addr.setObjectName('addressLabel'); addr.setTextFormat(Qt.RichText); addr.setWordWrap(True); addr.setText(f"<b>{raw_addr}</b>")
-        # Build meta line dynamically, omit unknown rooms instead of showing '? rooms'
-        meta_parts = []
-        listing_type = data.get('type', 'N/A')
-        if listing_type:
-            meta_parts.append(listing_type)
-        price_str = data.get('price_str') or ''
-        if price_str.strip():
-            meta_parts.append(price_str.strip())
+        st = status_text.upper()
+        badge.setObjectName(
+            'statusBadgeLive' if 'LIVE' in st else (
+                'statusBadgeSelectable' if 'SELECTABLE' in st else 'statusBadgePreview'
+            )
+        )
+        raw_addr = (data.get('address') or '').strip()
+        addr = QLabel(); addr.setObjectName('addressLabel'); addr.setTextFormat(Qt.TextFormat.RichText); addr.setWordWrap(True); addr.setText(f"<b>{raw_addr}</b>")
+        meta_parts: List[str] = []
+        if data.get('type'):
+            meta_parts.append(data['type'])
+        price_str = (data.get('price_str') or '').strip()
+        if price_str:
+            meta_parts.append(price_str)
         rooms_val = data.get('rooms')
         if rooms_val is not None:
-            rv_str = str(rooms_val).strip()
-            if rv_str and rv_str != '?' and rv_str.lower() != 'none':
+            rv = str(rooms_val).strip()
+            if rv and rv != '?' and rv.lower() != 'none':
                 try:
-                    n_rooms = int(float(rv_str))
-                    label_rooms = f"{n_rooms} room{'s' if n_rooms != 1 else ''}"
+                    n_rooms = int(float(rv))
+                    rv_label = f"{n_rooms} room{'s' if n_rooms != 1 else ''}"
                 except Exception:
-                    label_rooms = f"{rv_str} rooms"
-                meta_parts.append(f"<span class='dim'>{label_rooms}</span>")
-        meta = QLabel('  ·  '.join(meta_parts))
-        meta.setObjectName('metaLabel'); meta.setTextFormat(Qt.RichText); meta.setWordWrap(True)
+                    rv_label = f"{rv} rooms"
+                meta_parts.append(f"<span class='dim'>{rv_label}</span>")
+        meta = QLabel('  ·  '.join(meta_parts)); meta.setObjectName('metaLabel'); meta.setTextFormat(Qt.TextFormat.RichText); meta.setWordWrap(True)
         mid.addWidget(badge); mid.addWidget(addr); mid.addWidget(meta)
         row.addLayout(mid, 1)
 
-        # Right side actions (placeholder)
+        # Right column (actions)
         right = QVBoxLayout(); right.setSpacing(6)
-        apply_btn = QPushButton("Apply"); apply_btn.setEnabled(False)
-        right.addWidget(apply_btn); right.addStretch(1)
+        details_btn = QPushButton("Details")
+
+        def _open_details():
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Details")
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel(f"<b>{self.data.get('address','')}</b>"))
+            pairs = self.data.get('meta_pairs') or []
+            if pairs:
+                for k, val in pairs:
+                    v.addWidget(QLabel(f"{k}: {val}"))
+            else:
+                from pprint import pformat
+                dump = QLineEdit(); dump.setReadOnly(True)
+                dump.setText(pformat({k: self.data.get(k) for k in ('type','price_str','city','postcode','rooms','area_m2')}))
+                v.addWidget(dump)
+            close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            close.rejected.connect(dlg.reject)
+            v.addWidget(close)
+            dlg.exec()
+
+        details_btn.clicked.connect(_open_details)
+        right.addWidget(details_btn)
+        apply_btn = QPushButton("Apply")
+        apply_btn.setEnabled(bool(self.data.get('is_selectable')))
+        apply_btn.clicked.connect(lambda: self.applyRequested.emit(str(self.data.get('id'))))
+        right.addWidget(apply_btn)
+        right.addStretch(1)
         row.addLayout(right)
 
-        # Fixed width for consistent wrapping
         self.setFixedWidth(440)
 
         shadow = QGraphicsDropShadowEffect(self)
@@ -129,7 +151,7 @@ class ListingCard(QFrame):
         self.setGraphicsEffect(shadow)
         self._shadow = shadow
 
-        # Async image load (thumbnail) + prepare all images list
+        # Prepare images
         img_url = data.get('image_url')
         raw_list = data.get('image_urls') or []
         normalized: List[str] = []
@@ -140,53 +162,48 @@ class ListingCard(QFrame):
                 u = 'https:' + u
             normalized.append(u)
         if not normalized and img_url:
-            thumb_single = img_url
-            if thumb_single.startswith('//'):
-                thumb_single = 'https:' + thumb_single
-            normalized.append(thumb_single)
+            single = 'https:' + img_url if img_url.startswith('//') else img_url
+            normalized.append(single)
         self._all_images = normalized
         logger.debug(f"[CARD] images count={len(self._all_images)} first={self._all_images[0] if self._all_images else None}")
-        # choose thumbnail (prefer explicit image_url else first normalized)
-        thumb_url = None
+        thumb_url: str | None = None
         if img_url:
             thumb_url = 'https:' + img_url if img_url.startswith('//') else img_url
         elif self._all_images:
             thumb_url = self._all_images[0]
         if thumb_url:
-            logger.debug(f"[CARD] schedule image id={data.get('id')} url={thumb_url}")
             _IMAGE_EXECUTOR.submit(self._load_image, thumb_url)
         else:
             logger.debug(f"[CARD] no image for id={data.get('id')} addr={data.get('address')}")
 
-        # Kick off background prefetch of gallery images (excluding thumbnail) after slight delay
         if len(self._all_images) > 1:
             def _prefetch():
-                time.sleep(0.25)  # allow UI to settle
+                time.sleep(0.25)
                 for u in self._all_images:
                     if u == thumb_url:
                         continue
-                    if u in _GALLERY_CACHE:
-                        # refresh LRU position
-                        try:
-                            _GALLERY_CACHE.move_to_end(u)
-                        except Exception:
-                            pass
-                        continue
+                    with _GALLERY_CACHE_LOCK:
+                        if u in _GALLERY_CACHE:
+                            try:
+                                _GALLERY_CACHE.move_to_end(u)
+                            except Exception:
+                                pass
+                            continue
                     try:
                         getter = self._session.get if self._session else requests.get
                         r = getter(u, timeout=6)
                         if r.status_code == 200 and r.content:
                             qimg = QImage.fromData(r.content)
                             if not qimg.isNull():
-                                _GALLERY_CACHE[u] = qimg  # store QImage; convert to QPixmap in GUI thread
-                                if len(_GALLERY_CACHE) > _GALLERY_CACHE_LIMIT:
-                                    # trim oldest 10% to reduce churn
-                                    trim = max(10, int(_GALLERY_CACHE_LIMIT * 0.1))
-                                    for _ in range(trim):
-                                        try:
-                                            _GALLERY_CACHE.popitem(last=False)
-                                        except KeyError:
-                                            break
+                                with _GALLERY_CACHE_LOCK:
+                                    _GALLERY_CACHE[u] = qimg
+                                    if len(_GALLERY_CACHE) > _GALLERY_CACHE_LIMIT:
+                                        trim = max(10, int(_GALLERY_CACHE_LIMIT * 0.1))
+                                        for _ in range(trim):
+                                            try:
+                                                _GALLERY_CACHE.popitem(last=False)
+                                            except KeyError:
+                                                break
                                 logger.debug(f"[PREFETCH] cached gallery image {u}")
                         else:
                             logger.debug(f"[PREFETCH] skip status={r.status_code} url={u}")
@@ -225,7 +242,11 @@ class ListingCard(QFrame):
                     if not self._img_label:
                         return
                     w, h = self._img_label.width(), self._img_label.height()
-                    scaled = QPixmap.fromImage(img).scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    scaled = QPixmap.fromImage(img).scaled(
+                        w, h,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
                     x = (scaled.width() - w)//2; y = (scaled.height() - h)//2
                     pix = scaled.copy(x, y, w, h)
                     self._image_cache[url] = pix
@@ -265,7 +286,7 @@ class ListingCard(QFrame):
             anim.setDuration(240)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
-            anim.start(QPropertyAnimation.DeleteWhenStopped)
+            anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
         except Exception as e:
             logger.debug(f"[ANIM] fade failed: {e}")
 
@@ -293,152 +314,106 @@ class ListingCard(QFrame):
 
     # --- Image gallery dialog ---
     def _on_image_clicked(self, event: QMouseEvent):  # type: ignore
-        if not self._all_images:
+        if not getattr(self, '_all_images', None):
             logger.debug("[GALLERY] no images list empty")
             return
-        logger.debug(f"[GALLERY] open with {len(self._all_images)} images")
         dlg = QDialog(self)
         dlg.setWindowTitle("Images")
         dlg.resize(820, 560)
         v = QVBoxLayout(dlg)
         title = QLabel(self.data.get('address',''))
-        title.setAlignment(Qt.AlignCenter)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(title)
         img_label = QLabel("Loading...")
-        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         img_label.setMinimumSize(400, 300)
         v.addWidget(img_label, 1)
         nav = QHBoxLayout()
         prev_btn = QPushButton("◀ Previous")
         next_btn = QPushButton("Next ▶")
         counter_lbl = QLabel("")
-        nav.addWidget(prev_btn)
-        nav.addStretch(1)
-        nav.addWidget(counter_lbl)
-        nav.addStretch(1)
-        nav.addWidget(next_btn)
+        nav.addWidget(prev_btn); nav.addStretch(1); nav.addWidget(counter_lbl); nav.addStretch(1); nav.addWidget(next_btn)
         v.addLayout(nav)
-        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        v.addWidget(close_buttons)
-        close_buttons.rejected.connect(dlg.reject)
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); v.addWidget(close_box); close_box.rejected.connect(dlg.reject)
 
-        state = {'idx': 0, 'raw_cache': {}}  # raw_cache per dialog
+        state = {'idx': 0, 'raw_cache': {}}  # per-dialog cache
 
-        # Bridge object to safely transfer QImage from worker thread to GUI thread
-        class _GalleryBridge(QObject):
-            deliver = Signal(str, QImage)  # url, image
+        class _Bridge(QObject):
+            deliver = Signal(str, QImage)
 
-        bridge = _GalleryBridge(dlg)
-
-        def _on_deliver(u: str, qimg: QImage):
-            # Convert to QPixmap on GUI thread only
-            from PySide6.QtGui import QPixmap as _QPx
-            if qimg.isNull():
-                if self._all_images[state['idx']] == u:
-                    img_label.setText("Invalid")
-                return
-            pix = _QPx.fromImage(qimg)
-            state['raw_cache'][u] = pix
-            # Only update display if still on this image
-            if self._all_images[state['idx']] == u:
-                scale_and_set(pix)
-            logger.debug(f"[GALLERY] applied via bridge url={u} size={pix.width()}x{pix.height()}")
-
-        bridge.deliver.connect(_on_deliver)
+        bridge = _Bridge(dlg)
 
         def update_counter():
             counter_lbl.setText(f"{state['idx']+1} / {len(self._all_images)}")
 
         def scale_and_set(pix_raw: QPixmap):
             target_size = img_label.size()
-            if target_size.width() < 20:
-                target_size = dlg.size()
             margin = 40
             sw = max(50, target_size.width()-margin)
             sh = max(50, target_size.height()-margin)
-            scaled = pix_raw.scaled(sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled = pix_raw.scaled(sw, sh, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             img_label.setPixmap(scaled)
             img_label.setText("")
+
+        def _on_deliver(u: str, qimg: QImage):
+            if qimg.isNull():
+                if self._all_images[state['idx']] == u:
+                    img_label.setText("Invalid")
+                return
+            pix = QPixmap.fromImage(qimg)
+            state['raw_cache'][u] = pix
+            if self._all_images[state['idx']] == u:
+                scale_and_set(pix)
+        bridge.deliver.connect(_on_deliver)
 
         def load_index():
             update_counter()
             idx = state['idx']
             url = self._all_images[idx]
             img_label.setText("Loading...")
-            # prefer existing raw
-            raw = state['raw_cache'].get(url) if isinstance(state['raw_cache'], dict) else None
-            if raw:
-                scale_and_set(raw); return
-            # Check global prefetch cache
-            global_img = _GALLERY_CACHE.get(url)
+            raw_pix = state['raw_cache'].get(url)
+            if raw_pix:
+                scale_and_set(raw_pix); return
+            with _GALLERY_CACHE_LOCK:
+                global_img = _GALLERY_CACHE.get(url)
             if global_img:
-                # Directly emit through bridge for consistency
                 bridge.deliver.emit(url, global_img)
-                logger.debug(f"[GALLERY] used prefetched cache url={url}")
                 return
             def worker():
                 try:
-                    logger.debug(f"[GALLERY] fetch start idx={idx} url={url}")
-                    getter = self._session.get if getattr(self, '_session', None) else requests.get
-                    attempts = 3
-                    last_status = None
-                    r = None
+                    sess = self._session if isinstance(self._session, requests.Session) else None
+                    getter = sess.get if sess else requests.get
+                    attempts = 3; last_status = None; r = None
                     for a in range(1, attempts+1):
                         try:
-                            r = getter(url, timeout=10)
-                            last_status = r.status_code
+                            r = getter(url, timeout=10); last_status = r.status_code
                             if r.status_code == 200 and r.content:
                                 break
-                            logger.debug(f"[GALLERY] attempt {a} status={r.status_code} url={url}")
                         except Exception as ie:
                             logger.debug(f"[GALLERY] attempt {a} error {ie} url={url}")
-                        time.sleep(0.35 * a)
+                        time.sleep(0.3 * a)
                     if not r or r.status_code != 200 or not r.content:
-                        logger.debug(f"[GALLERY] fetch fail status={last_status} url={url}")
                         QTimer.singleShot(0, lambda s=last_status: img_label.setText(f"Failed ({s})")); return
                     qimg = QImage.fromData(r.content)
                     if qimg.isNull():
-                        logger.debug(f"[GALLERY] invalid image data url={url}")
                         QTimer.singleShot(0, lambda: img_label.setText("Invalid")); return
-                    # Emit image to GUI thread for conversion & display
                     bridge.deliver.emit(url, qimg)
-                    logger.debug(f"[GALLERY] fetch ok idx={idx} url={url} size={qimg.width()}x{qimg.height()}")
                 except Exception as e:
                     logger.debug(f"[GALLERY] fetch error {url}: {e}")
                     QTimer.singleShot(0, lambda: img_label.setText("Error"))
             threading.Thread(target=worker, daemon=True).start()
 
         def prev_clicked():
-            if state['idx'] > 0:
-                state['idx'] -= 1; load_index()
-            else:  # wrap
-                state['idx'] = len(self._all_images) - 1; load_index()
-
+            state['idx'] = (state['idx'] - 1) % len(self._all_images); load_index()
         def next_clicked():
-            if state['idx'] < len(self._all_images) - 1:
-                state['idx'] += 1; load_index()
-            else:  # wrap
-                state['idx'] = 0; load_index()
-
-        def key_press(ev):  # simple key handling
-            from PySide6.QtGui import QKeyEvent
-            if isinstance(ev, QKeyEvent):
-                if ev.key() in (Qt.Key_Left, Qt.Key_A):
-                    prev_clicked(); ev.accept(); return
-                if ev.key() in (Qt.Key_Right, Qt.Key_D):
-                    next_clicked(); ev.accept(); return
-                if ev.key() in (Qt.Key_Escape,):
-                    dlg.reject(); ev.accept(); return
-            return orig_event(ev)
+            state['idx'] = (state['idx'] + 1) % len(self._all_images); load_index()
 
         prev_btn.clicked.connect(prev_clicked)
         next_btn.clicked.connect(next_clicked)
 
-        # Resize handling to rescale current image
         orig_resize = dlg.resizeEvent
         def resize_event(e):
             if img_label.pixmap():
-                # rescale current raw
                 url = self._all_images[state['idx']]
                 raw_pix = state['raw_cache'].get(url)
                 if raw_pix:
@@ -446,11 +421,20 @@ class ListingCard(QFrame):
             return orig_resize(e) if orig_resize else None
         dlg.resizeEvent = resize_event  # type: ignore
 
-        # Keyboard navigation
+        from PySide6.QtGui import QKeyEvent
         orig_event = dlg.event
-        dlg.event = key_press  # type: ignore
+        def key_event(ev):
+            if isinstance(ev, QKeyEvent):
+                if ev.key() in (Qt.Key.Key_Left, Qt.Key.Key_A):
+                    prev_clicked(); ev.accept(); return True
+                if ev.key() in (Qt.Key.Key_Right, Qt.Key.Key_D):
+                    next_clicked(); ev.accept(); return True
+                if ev.key() == Qt.Key.Key_Escape:
+                    dlg.reject(); ev.accept(); return True
+            return orig_event(ev)
+        dlg.event = key_event  # type: ignore
 
-        QTimer.singleShot(60, load_index)
+        QTimer.singleShot(50, load_index)
         dlg.exec()
 
 
@@ -465,10 +449,10 @@ class MainWindow(QMainWindow):
         import threading
         self.client = WoonnetClient(status_queue=None, logger=__import__('logging').getLogger(APP_TITLE), log_file_path='qt.log')  # type: ignore
         threading.Thread(target=self.client.start_headless_browser, daemon=True).start()
-        self.thread = QThread(self)
+        self._thread = QThread(self)
         self.worker = BotWorker(self.client)
-        self.worker.moveToThread(self.thread)
-        self.thread.start()
+        self.worker.moveToThread(self._thread)
+        self._thread.start()
 
         self._build_menu()
         self._build_ui()
@@ -496,7 +480,7 @@ class MainWindow(QMainWindow):
         # Login / controls row
         bar = QHBoxLayout(); bar.setSpacing(10)
         self.user_edit = QLineEdit(); self.user_edit.setPlaceholderText('Username')
-        self.pass_edit = QLineEdit(); self.pass_edit.setPlaceholderText('Password'); self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit = QLineEdit(); self.pass_edit.setPlaceholderText('Password'); self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.login_btn = QPushButton('Login'); self.login_btn.setObjectName('PrimaryButton'); self.login_btn.clicked.connect(self._do_login)
         self.discover_btn = QPushButton('Discover'); self.discover_btn.clicked.connect(self._trigger_discover); self.discover_btn.setEnabled(False)
         self.remember_chk = QCheckBox('Remember')
@@ -514,7 +498,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.scroll_area, 1)
 
         # Metrics bar
-        self.metrics_bar = QLabel(objectName='MetricsBar')
+        self.metrics_bar = QLabel()
+        self.metrics_bar.setObjectName('MetricsBar')
         self.metrics_bar.setText('Metrics: —')
         outer.addWidget(self.metrics_bar)
 
@@ -596,7 +581,9 @@ class MainWindow(QMainWindow):
         for data in listings:
             imgs_ct = len(data.get('image_urls') or [])
             logger.debug(f"[LISTING] id={data.get('id')} addr={data.get('address')} image_url={data.get('image_url')} imgs={imgs_ct}")
-            self.cards_layout.addWidget(ListingCard(data, session=self.client.session))
+            card = ListingCard(data, session=self.client.session)
+            card.applyRequested.connect(self._apply_one)
+            self.cards_layout.addWidget(card)
         self.statusBar().showMessage(f"Loaded {len(listings)} listings")
         self._discover_in_progress = False
 
@@ -611,6 +598,13 @@ class MainWindow(QMainWindow):
     def _toggle_metrics(self):
         self.metrics_visible = not self.metrics_visible
         self.metrics_bar.setVisible(self.metrics_visible)
+
+    @Slot(str)
+    def _apply_one(self, listing_id: str):
+        # apply a single listing via worker
+        self.statusBar().showMessage(f"Applying to {listing_id}...")
+        import threading as _th
+        _th.Thread(target=lambda: self.worker.apply([listing_id]), daemon=True).start()
 
     # Credential persistence ------------------------------------------
     def _load_credentials(self):
@@ -639,7 +633,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.thread.quit(); self.thread.wait(1000)
+            self._thread.quit(); self._thread.wait(1000)
         except Exception:
             pass
         super().closeEvent(event)

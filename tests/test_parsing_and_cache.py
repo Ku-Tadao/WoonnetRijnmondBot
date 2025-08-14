@@ -34,6 +34,18 @@ def test_cache_roundtrip():
         c2.load_cached_ids()
         assert c2._last_listing_ids == {'1','2','3'}
 
+def test_cookie_persistence_roundtrip():
+    with tempfile.TemporaryDirectory() as td:
+        c = make_client(td)
+        c.set_cache_path(td)
+        # Simulate a login-set cookie
+        c.session.cookies.set('TestCookie', 'ABC123', domain='example.com', path='/')
+        c.save_cookies()
+        # New client should load it
+        c2 = make_client(td)
+        c2.set_cache_path(td)
+        assert c2.session.cookies.get('TestCookie') == 'ABC123'
+
 def test_debug_patch_and_unpatch():
     with tempfile.TemporaryDirectory() as td:
         c = make_client(td)

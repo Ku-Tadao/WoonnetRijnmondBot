@@ -25,9 +25,9 @@ class BotWorker(QObject):
 
     @Slot()
     def discover(self):
-        listings = self.client.discover_listings_api()
-        if listings:
-            self.listings.emit(listings)
+            listings = self.client.discover_listings_api()
+            # Always emit (even empty) so UI can refresh state when no new listings
+            self.listings.emit(listings or [])
 
     @Slot(list)
     def apply(self, listing_ids: Sequence[str]):

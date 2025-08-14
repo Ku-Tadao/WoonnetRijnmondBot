@@ -26,7 +26,8 @@ from reporting import send_discord_report
 from config import (
     BASE_URL, LOGIN_URL, DISCOVERY_URL, API_DISCOVERY_URL, API_DETAILS_SINGLE_URL,
     API_TIMER_URL, USERNAME_FIELD_SELECTOR, PASSWORD_FIELD_SELECTOR,
-    LOGIN_BUTTON_SELECTOR, LOGOUT_LINK_SELECTOR, USER_AGENT, APPLICATION_HOUR
+    LOGIN_BUTTON_SELECTOR, LOGOUT_LINK_SELECTOR, USER_AGENT, APPLICATION_HOUR,
+    PRE_SELECTION_HOUR, PRE_SELECTION_MINUTE, FINAL_REFRESH_HOUR, FINAL_REFRESH_MINUTE
 )
 
 if not getattr(sys, 'frozen', False):  # only import manager when not frozen
@@ -68,15 +69,32 @@ class WoonnetClient:
         self.log_file_path = log_file_path
         self.stop_event = threading.Event()
         self.session = requests.Session()
+        # Concurrency configuration early (used for HTTP adapter sizing)
+        self.max_workers = max(1, max_workers)
+
+        # HTTP adapter with retry & pool sizing
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util.retry import Retry  # type: ignore
+        except Exception:
+            Retry = None  # type: ignore
+        pool_sz = max(32, self.max_workers * 2)
+        adapter = HTTPAdapter(
+            pool_connections=pool_sz,
+            pool_maxsize=pool_sz,
+            max_retries=Retry(total=2, backoff_factor=0.25, status_forcelist=[500, 502, 503, 504]) if Retry else 0
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+        # State / instrumentation
         self.is_logged_in = False
-        # Instrumentation
         self.debug = False
         self.trace_http_bodies = True
-        self._last_listing_ids = set()
+        self._last_listing_ids: set[str] = set()
         self._empty_runs = 0
         self.cache_path = None
         self._orig_request_func = None
-        self.max_workers = max(1, max_workers)
         # Metrics (thread-safe counters)
         self._metrics_lock = threading.Lock()
         self._metrics = {
@@ -93,15 +111,15 @@ class WoonnetClient:
             'apply_attempts': 0,
             'apply_success': 0,
         }
-        # Respect env override
+
+        # Respect env override for browser
         if os.environ.get("WOONNET_NO_BROWSER") == "1":
             enable_browser = False
-        # Browser service (optional)
+
         self.service = None
         if enable_browser:
             try:
                 if getattr(sys, 'frozen', False):
-                    # Expect chromedriver.exe adjacent to the executable (one-dir build) or in _MEIPASS fallback.
                     base_dir = os.path.dirname(sys.executable)
                     candidate_paths = [
                         os.path.join(base_dir, 'chromedriver.exe'),
@@ -109,7 +127,6 @@ class WoonnetClient:
                     ]
                     driver_path = next((p for p in candidate_paths if os.path.exists(p)), None)
                     if not driver_path:
-                        # Attempt on-demand download (small fallback) – only if network available.
                         try:
                             import urllib.request, zipfile, io, json as _json
                             self._log("Chromedriver not bundled; attempting runtime download of latest stable...")
@@ -273,6 +290,11 @@ class WoonnetClient:
             except Exception:
                 pass
             self.is_logged_in = True
+            # Persist cookies after a successful login so future runs can reuse them.
+            try:
+                self.save_cookies()
+            except Exception:
+                pass
             return True, self.session
         except Exception as e:
             self._report_error(e, f"during login for user '{username}'")
@@ -298,6 +320,32 @@ class WoonnetClient:
         try: return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
         except Exception: return None
 
+    # --- Internal helpers ---
+    def _fetch_discovery_pages(self, base_payload: dict, *, max_pages: int = 20) -> list[dict]:
+        """Fetch all discovery pages until exhaustion or max_pages.
+
+        Emulates client-side pagination the site would perform. Stops early when a page
+        returns fewer results than requested or an empty list. Any HTTP error bubbles
+        up to caller to preserve existing error reporting semantics there.
+        """
+        all_results: list[dict] = []
+        per_page = int(base_payload.get("paginaGrootte", 100) or 100)
+        for page in range(1, max_pages + 1):
+            payload = dict(base_payload)
+            payload["paginaNummer"] = page
+            r = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15)
+            r.raise_for_status()
+            data = r.json() or {}
+            batch = (data.get('d') or {}).get('resultaten') or []
+            if self.debug:
+                self._log(f"[DISCOVER:PAGINATION] page={page} batch={len(batch)} total_so_far={len(all_results)}")
+            if not batch:
+                break
+            all_results.extend(batch)
+            if len(batch) < per_page:  # last page (short)
+                break
+        return all_results
+
     # --- Discovery & Details ---
     def discover_listings_api(self) -> List[Dict[str, Any]]:
         if not self.is_logged_in:
@@ -306,17 +354,19 @@ class WoonnetClient:
         overall_start = time.perf_counter()
         try:
             payload = {
-                "woonwens": {"Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")},
-                "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag"
+                "woonwens": {
+                    "Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}],
+                    "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d"),
+                },
+                "paginaNummer": 1,
+                "paginaGrootte": 100,
+                "filterMode": "AlleenNieuwVandaag",
             }
             if self.debug:
-                self._log(f"[DISCOVER] POST {API_DISCOVERY_URL} payload={payload}")
-            response = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            initial_listings = data.get('d', {}).get('resultaten', [])
+                self._log(f"[DISCOVER] BEGIN pagination payload={payload}")
+            initial_listings = self._fetch_discovery_pages(payload, max_pages=25)
             if self.debug:
-                self._log(f"Discovery HTTP {response.status_code}; raw count={len(initial_listings)}")
+                self._log(f"[DISCOVER] Aggregated listings count={len(initial_listings)}")
             current_ids = {r.get('FrontendAdvertentieId') for r in initial_listings if r.get('FrontendAdvertentieId')}
             if not current_ids:
                 self._empty_runs += 1
@@ -331,7 +381,8 @@ class WoonnetClient:
                 return []
             new_ids = current_ids - self._last_listing_ids
             disappeared = self._last_listing_ids - current_ids
-            self._last_listing_ids = current_ids
+            # Normalize to set[str] to satisfy type checking
+            self._last_listing_ids = {str(x) for x in current_ids if x is not None}
             self._empty_runs = 0
             self._log(f"Change detected: +{len(new_ids)} / -{len(disappeared)} (total {len(current_ids)}). Fetching details...")
             with self._metrics_lock:
@@ -352,14 +403,20 @@ class WoonnetClient:
                         continue
                     if self.debug:
                         self._log(f"[DETAIL] Got detail for ID {item.get('id')} keys={list(item)[:15]}")
+                    # --- Status / window computation using precise timing constants ---
                     now = datetime.now()
                     publ_start_dt = self._parse_publ_date(item.get('publstart'))
-                    is_live = publ_start_dt and now >= publ_start_dt
-                    is_in_window = now.hour >= APPLICATION_HOUR - 2
+                    from datetime import time as _time
+                    pre_sel = _time(hour=PRE_SELECTION_HOUR, minute=PRE_SELECTION_MINUTE)
+                    final_refresh = _time(hour=FINAL_REFRESH_HOUR, minute=FINAL_REFRESH_MINUTE)  # reserved for potential future nuanced states
+                    app_time = _time(hour=APPLICATION_HOUR, minute=0)
+                    t_now = now.time()
+                    is_live = bool(publ_start_dt and now >= publ_start_dt)
+                    is_in_window = (pre_sel <= t_now <= app_time)
                     if is_live:
                         status_text = "LIVE"
                     else:
-                        start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else f"{APPLICATION_HOUR}:00"
+                        start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else f"{APPLICATION_HOUR:02d}:00"
                         status_text = f"SELECTABLE ({start_time_str})" if is_in_window else f"PREVIEW ({start_time_str})"
                     can_select = is_live or is_in_window
                     media_items = item.get('media', []) or []
@@ -375,6 +432,38 @@ class WoonnetClient:
                                 image_urls.append(full)
                         if len(image_urls) >= 8:
                             break
+                    # Heuristic extraction of commonly displayed metadata + preservation of raw detail
+                    def _pick(d: dict, *candidates: str):
+                        # tolerant lookups (exact, then case-insensitive contains)
+                        for k in candidates:
+                            if k in d and d[k] not in (None, "", "?"):
+                                return d[k]
+                        dl = {str(k).lower(): k for k in d.keys()}
+                        for lk, orig in dl.items():
+                            for want in candidates:
+                                if want.lower() in lk and d[orig] not in (None, "", "?"):
+                                    return d[orig]
+                        return None
+
+                    rooms_val = _pick(item, "kamers", "aantalKamers", "AantalKamers", "kamersAantal")
+                    surf_val  = _pick(item, "oppervlakte", "WoonOppervlakte", "m2", "m\u00b2")
+                    city      = _pick(item, "plaats", "woonplaats", "stad")
+                    postcode  = _pick(item, "postcode")
+                    energylbl = _pick(item, "energielabel", "energieLabel")
+                    service   = _pick(item, "servicekosten", "ServiceKosten", "service_kosten")
+
+                    meta_pairs = []
+                    for label, val in (
+                        ("Rooms", rooms_val),
+                        ("Area", f"{surf_val} m²" if surf_val else None),
+                        ("City", city),
+                        ("Postcode", postcode),
+                        ("Energy", energylbl),
+                        ("Service costs", f"€ {service}" if service else None),
+                    ):
+                        if val:
+                            meta_pairs.append((label, str(val)))
+
                     processed.append({
                         'id': item.get('id'),
                         'address': f"{item.get('straat','')} {item.get('huisnummer','')}",
@@ -384,7 +473,15 @@ class WoonnetClient:
                         'status_text': status_text,
                         'is_selectable': can_select,
                         'image_url': image_url,
-                        'image_urls': image_urls
+                        'image_urls': image_urls,
+                        'rooms': rooms_val,
+                        'area_m2': surf_val,
+                        'city': city,
+                        'postcode': postcode,
+                        'energy_label': energylbl,
+                        'service_costs': service,
+                        'meta_pairs': meta_pairs,
+                        'raw_detail': item,
                     })
                     with self._metrics_lock:
                         self._metrics['detail_fetch_items'] += 1
@@ -474,10 +571,17 @@ class WoonnetClient:
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(_apply_task, lid): lid for lid in listing_ids}
             for f in as_completed(futures):
-                if f.result():
+                ok = False
+                try:
+                    ok = bool(f.result())
+                finally:
+                    with self._metrics_lock:
+                        self._metrics['apply_attempts'] += 1
+                        if ok:
+                            self._metrics['apply_success'] += 1
+                if ok:
                     success += 1
-                with self._metrics_lock:
-                    self._metrics['apply_attempts'] += 1
+
         self._log(f"Finished. Applied to {success} of {len(listing_ids)} selected listings.")
 
     def _extract_postable_form(self, html: str, base_url: str) -> Tuple[Optional[str], dict]:
@@ -561,6 +665,8 @@ class WoonnetClient:
         The file `last_ids.json` will be stored in this directory.
         """
         self.cache_path = directory
+        # Load any previously saved session cookies when a cache path becomes available.
+        self.load_cookies()
 
     def load_cached_ids(self) -> None:
         if not self.cache_path: return
@@ -577,12 +683,43 @@ class WoonnetClient:
         if not self.cache_path: return
         fp = os.path.join(self.cache_path, 'last_ids.json')
         try:
-            with open(fp,'w',encoding='utf-8') as f: json.dump(sorted(self._last_listing_ids), f)
+            with open(fp,'w',encoding='utf-8') as f: json.dump(sorted(str(x) for x in self._last_listing_ids), f)
         except Exception: pass
+
+    # --- Cookie persistence ---
+    def _cookies_path(self) -> Optional[str]:
+        return os.path.join(self.cache_path, 'cookies.json') if self.cache_path else None
+
+    def save_cookies(self) -> None:
+        """Serialize current session cookies to disk (best-effort)."""
+        try:
+            p = self._cookies_path()
+            if not p:
+                return
+            from requests.utils import dict_from_cookiejar
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(dict_from_cookiejar(self.session.cookies), f)
+            self._log(f"Saved cookies to {p}")
+        except Exception as e:
+            self._log(f"Could not save cookies: {e}", 'warning')
+
+    def load_cookies(self) -> None:
+        """Load previously persisted cookies into the session (best-effort)."""
+        try:
+            p = self._cookies_path()
+            if not p or not os.path.exists(p):
+                return
+            from requests.utils import cookiejar_from_dict
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.session.cookies = cookiejar_from_dict(data)
+            self._log(f"Loaded cookies from {p}")
+        except Exception as e:
+            self._log(f"Could not load cookies: {e}", 'warning')
     
     def get_cached_listing_ids(self) -> List[str]:
         """Return a snapshot list of the last discovered listing IDs (for tests / diagnostics)."""
-        return sorted(self._last_listing_ids)
+        return sorted(str(x) for x in self._last_listing_ids)
 
     # --- Debug toggles ---
     def set_debug(self, enabled: bool) -> None:

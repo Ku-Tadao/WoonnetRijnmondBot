@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import types
 from ui_qt.main import ListingCard, QApplication
 from PySide6.QtWidgets import QLabel
