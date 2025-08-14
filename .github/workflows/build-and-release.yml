@@ -40,7 +40,8 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path 'assets/icon.ico') {
-            $iconArg = '--icon assets/icon.ico'
+            # PyInstaller (current version in CI) only exposes the short -i form (no --icon long option in help output)
+            $iconArg = '-i assets/icon.ico'
           } else {
             Write-Host 'Icon not found (assets/icon.ico); continuing without custom icon.'
             $iconArg = ''
