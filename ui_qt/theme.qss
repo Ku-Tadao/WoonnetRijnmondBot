@@ -1,0 +1,52 @@
+/* Palette driven theme (Falu Red #721817, Sandy Brown #FA9F42, Indigo Dye #2B4162, Dartmouth Green #0B6E4F, Platinum #E0E0E2) */
+* { font-family: "Segoe UI", Arial, sans-serif; }
+
+/* Base */
+QWidget { background: #1e2934; color:#E0E0E2; font-size: 11pt; }
+QStatusBar, QMenuBar { background:#2B4162; color:#E0E0E2; }
+QMenu { background:#2B4162; border:1px solid #22344b; }
+QMenu::item { padding:6px 18px; }
+QMenu::item:selected { background:#36527a; }
+
+/* Scrollbar */
+QScrollBar:vertical { background:transparent; width:12px; }
+QScrollBar::handle:vertical { background:#36527a; border-radius:6px; margin:2px; }
+QScrollBar::handle:vertical:hover { background:#41628f; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+
+/* Buttons */
+QPushButton { background:#2B4162; border:1px solid #20344d; padding:6px 14px; border-radius:8px; font-weight:500; }
+QPushButton:hover { background:#36527a; }
+QPushButton:pressed { background:#22344b; }
+QPushButton:disabled { background:#25374f; color:#88929b; }
+QPushButton#PrimaryButton { background:#FA9F42; border:1px solid #e08723; color:#2B4162; font-weight:600; }
+QPushButton#PrimaryButton:hover { background:#ffad5b; }
+QPushButton#PrimaryButton:pressed { background:#e08723; }
+
+/* Inputs */
+QLineEdit { background:#233445; border:1px solid #2f4863; border-radius:6px; padding:6px 10px; selection-background-color:#FA9F42; selection-color:#2B4162; }
+QLineEdit:focus { border:1px solid #FA9F42; }
+
+/* Metrics */
+#MetricsBar { background:#2B4162; border:0; padding:6px 12px; font-size:10pt; }
+
+/* Cards */
+#CardFrame { background:#2B4162; border:1px solid #20344d; border-radius:16px; }
+#CardFrame:hover { border-color:#FA9F42; }
+#CardFrame QLabel { color:#E0E0E2; background:transparent; }
+
+/* Status badges (filled) */
+QLabel#statusBadgeLive { background:#0B6E4F; color:#E0E0E2; padding:4px 10px; border-radius:14px; font-size:10pt; font-weight:600; }
+QLabel#statusBadgeSelectable { background:#FA9F42; color:#2B4162; padding:4px 10px; border-radius:14px; font-size:10pt; font-weight:600; }
+QLabel#statusBadgePreview { background:#721817; color:#E0E0E2; padding:4px 10px; border-radius:14px; font-size:10pt; font-weight:600; }
+
+/* Utility text */
+.dim { color:#c2c8cc; }
+
+/* Image placeholder inside card (lighter, no harsh contrast) */
+#CardFrame QLabel.cardImage { background:#233445; color:#8896a3; font-size:10pt; border:1px solid #2f4863; border-radius:10px; }
+/* Error placeholder */
+#CardFrame QLabel#cardImageError { background:#3a2020; color:#FA9F42; font-size:10pt; border:1px dashed #FA9F42; border-radius:10px; }
+
+/* Hover elevation: handled via runtime shadow effect (removed unsupported box-shadow) */
+

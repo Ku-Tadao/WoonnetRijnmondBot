@@ -3,9 +3,8 @@ requests
 selenium
 beautifulsoup4
 
-# GUI
-ttkbootstrap
-Pillow
+# GUI (Qt only)
+PySide6
 
 # System & Security
 keyring

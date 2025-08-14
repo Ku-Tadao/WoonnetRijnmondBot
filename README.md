@@ -1,204 +1,137 @@
 # WoonnetRijnmondBot
+Modern Python bot to assist with discovery and on‑time applications for WoonnetRijnmond listings.
+## UI (Qt / PySide6)
+The interface is a PySide6 (Qt) application located in `ui_qt/main.py`, offering:
+- Responsive card layout (custom FlowLayout) with hover elevation shadows
+- Fade‑in thumbnail animation & robust threaded loading (LRU cache + retries)
+- Multi‑image gallery dialog:
+	- Keyboard navigation (←/→ or A/D, Esc to close, wrap‑around)
+	- Prefetch & global gallery cache (stores QImage; converted to QPixmap on GUI thread)
+	- Retry with incremental backoff & clear failure labeling (e.g. 520 responses)
+	- Immediate re-display when navigating back (signal bridge)
+- Distinct status badges (PREVIEW / SELECTABLE / LIVE)
+- Secure credential storage via `keyring`
+- Shared authenticated `requests.Session` (Selenium bootstrap → all HTTP/image fetches)
+- Structured logging in `qt_ui.log` (thumbnails, gallery, prefetch diagnostics)
 
-Modular Python bot to assist with discovery and on-time applications for
-WoonnetRijnmond listings. The project has been refactored into clear layers:
+Legacy Tk / ttkbootstrap UI has been fully removed (simplifies dependencies and build size).
+## Core Features
 
-- `core/automation.py` → Headless browser + API client (`WoonnetClient`).
-- `ui/app.py` → Modern `ttkbootstrap` GUI (`App`).
-- `main.py` → Minimal entrypoint launching the UI.
--- Legacy shims removed (`bot.py`, `hybrid_bot.py`); import directly from new modules.
+- Headless Selenium login with cookie transfer to persistent session
+- Smart listing discovery (change detection & ID cache persistence)
+- Parallel detail fetching & application submission
+- Adaptive refresh cadence (time‑aware)
+- Server countdown integration prior to application window
+- Debug instrumentation toggle for HTTP tracing
+- Discord error reporting hook (`reporting.py`)
+## Architecture
 
-## Features
+```
+main.py (entry -> Qt)
+ ├─ ui_qt/main.py (Qt UI, gallery, image caches)
+ └─ core/automation.py (WoonnetClient: login, discover, apply, metrics)
+```
 
-- Headless Selenium login with cookie handoff to a fast `requests` session.
-- Smart listing discovery with change detection and cached ID persistence.
-- Parallel detail fetching & application submission for speed.
-- Adaptive refresh cadence (slows when far from 20:00, accelerates near window).
-- Precise server-side countdown usage (when API provides timer).
-- Rich debug mode: full HTTP request/response tracing (toggleable body dump).
-- GUI listing cards with status (PREVIEW / SELECTABLE / LIVE) and image thumbnails.
-- Secure credential storage via `keyring`.
-- Discord error reporting hook (see `reporting.py`).
+### Responsibilities
+
+- Core (`core/automation.py`): Automation + HTTP + parsing; metrics & debug toggles. Supports `enable_browser=False` or `WOONNET_NO_BROWSER=1` for headless test runs without Selenium.
+- Qt UI (`ui_qt/main.py`): Rich interactive UX (cards, gallery, prefetch, metrics text, credential persistence).
+- Entry (`main.py`): Launches Qt UI.
+ (Legacy Tk UI removed.)
 
 ## Running (Source)
-
-```bash
-python -m pip install -r requirements.txt
-python main.py
-```
-
-Or directly:
-
-```bash
-python -m ui.app
-```
-
-Legacy shim entrypoints have been removed; use `python main.py` (preferred) or `python -m ui.app`.
-
-### Quick Start (Windows PowerShell)
 
 ```powershell
 python -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python main.py
+python main.py          # launches Qt UI
 ```
 
+Direct module execution:
+
+```powershell
+python -m ui_qt.main    # Qt UI (alternate invocation)
+```
 ### Environment Variables
 
 | Variable | Purpose | Typical Use |
 |----------|---------|-------------|
 | `WOONNET_NO_BROWSER=1` | Skip Selenium driver init (no Chrome needed) | Running unit tests / CI |
 | `PYTHONWARNINGS=ignore` | Suppress noisy warnings | Optional |
-
 Example (PowerShell):
 
 ```powershell
 $env:WOONNET_NO_BROWSER=1; pytest -q
 ```
-
-## Building Executable
-
-Use the provided PyInstaller spec (`WoonnetRijnmondBot.spec`) or create a new one targeting `main.py`.
-
-Example (PowerShell):
+## Building Executable (PyInstaller)
 
 ```powershell
 pyinstaller --noconfirm --clean --icon assets/icon.ico --name WoonnetRijnmondBot main.py
 ```
 
-If you add or rename modules, regenerate the spec (or edit existing) so `main.py` is the entrypoint. Include `assets/icon.ico` in the spec if not already.
+Ensure spec includes icon + any future Qt resources.
+## Debug Mode (Core Client)
 
-## Debug Mode
-
-Enable via View → Debug Mode (GUI). While enabled:
-
-- Each HTTP request logs method, URL, headers, and optional JSON/data snippet.
-- Each response logs status, size, duration, and (if enabled) a body snippet.
-- Toggle body dumps by calling `set_http_body_trace(False)` on the client if needed.
-
-Programmatic example:
+Enable in code:
 
 ```python
-from core.automation import WoonnetClient
-from queue import Queue
-import logging
-
-client = WoonnetClient(Queue(), logging.getLogger('woonnet'), 'bot.log')
-client.set_debug(True)              # enable HTTP tracing
-client.set_http_body_trace(False)   # suppress response body snippets
+client.set_debug(True)
+client.set_http_body_trace(False)  # to suppress body dumps
 ```
+## Data Flow (Qt)
 
-## Architecture Overview
-
-```
-main.py
- ├─ ui/app.py (UI: App, ListingCard)
- └─ core/automation.py (WoonnetClient: login, discover, apply)
-```
-
-Data Flow:
-1. UI triggers login → headless Selenium session → cookies transferred to `requests`.
-2. Discovery posts API filter → returns listing IDs → parallel detail fetch.
-3. Listings rendered in UI with selection toggles; cached IDs persisted (avoid noise).
-4. Application queue waits for server timer or 20:00 → parallel form submissions.
-
-### Layer Responsibilities
-
-- Core (`core/automation.py`): Pure automation + HTTP + parsing. Exposes toggles and helper methods; now supports `enable_browser=False` / `WOONNET_NO_BROWSER=1` to facilitate fast tests without a Chrome driver.
-- UI (`ui/app.py`): Tk/ttkbootstrap interface (listing cards, auto-refresh logic, logging surface, selection UX, debug toggle). Calls into core; no scraping logic lives here.
-- Shims: Removed to simplify codebase (previously `bot.py`, `hybrid_bot.py`).
-- Entry (`main.py`): Minimal launcher for end users and packaging.
-
-## Migration Notes
-
-If you previously imported `WoonnetBot` from `bot`, update to:
-
-```python
-from core.automation import WoonnetClient
-```
-
-`WoonnetBot` remains an alias in `core.automation` only.
-
-To bypass Selenium (e.g., CI tests), either:
-
-```python
-client = WoonnetClient(queue, logger, log_file_path='bot.log', enable_browser=False)
-```
-
-or set environment variable:
-
-```powershell
-$env:WOONNET_NO_BROWSER=1
-```
-
-Then only non-browser dependent methods (parsing utilities, cache persistence) are exercised.
-
+1. Login triggers Selenium headless browser → cookies transferred to `requests.Session`.
+2. Core discovery posts API payload → listing IDs & details (parallel) → enriched listing dicts.
+3. Qt UI renders `ListingCard` widgets; thumbnail fetchers run in thread pool.
+4. User opens gallery; prefetch cache serves or background fetch retries.
+5. On application window open / countdown complete, parallel submissions executed.
 ## Testing
 
-Unit tests live in `tests/`. Current coverage focuses on:
-
-- Price parsing and publication date parsing.
-- ID cache persistence (`last_ids.json`).
-- Debug tracing patch/unpatch (ensures HTTP request wrapper attaches/detaches cleanly).
-
-Run all tests (headless / no browser):
-
 ```powershell
-python -m venv .venv
-. .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
 $env:WOONNET_NO_BROWSER=1; pytest -q
 ```
 
-Add more tests by mocking HTTP (e.g., with `responses` or `requests-mock`) to simulate API discovery payloads and application form HTML.
+Existing focus:
+- Price & publication parsing
+- ID cache persistence
+- Gallery logic (URL normalization & wrap-around navigation)
 
-### Suggested Future Tests
-
-- Mocked `discover_listings_api` sequence demonstrating change detection (+/- IDs).
-- Form extraction edge cases (missing token, multiple forms).
-- Auto-refresh scheduling intervals (extract logic into pure function for deterministic tests).
-
+Suggested additions:
+- Discovery change detection (added/removed IDs)
+- Gallery retry and 520 edge cases (mocked)
+- Prefetch cache eviction behavior
+- Application form parsing variants
 ## Development Workflow
 
-1. Create / activate virtual environment.
-2. Install dependencies from `requirements.txt`.
-3. Run `python main.py` (GUI) or write scripts against `WoonnetClient`.
-4. Enable debug mode via GUI (View → Debug Mode) for verbose HTTP tracing.
-5. Run tests with `pytest -q` (set `WOONNET_NO_BROWSER=1` for speed).
-6. Before packaging, clear old `dist/` & `build/` directories (PyInstaller) to avoid stale artifacts.
-
+1. Create / activate venv
+2. Install deps `pip install -r requirements.txt`
+3. Run `python main.py` (Qt UI)
+4. Enable debug (future menu toggle) or via client API
+5. Tests: `WOONNET_NO_BROWSER=1 pytest -q`
+6. Package with PyInstaller when ready
 ## Credentials Handling
 
-- Stored securely via `keyring` when you check "Remember credentials".
-- To clear saved values: remove the service entries through your OS credential manager or uncheck and restart (no plaintext file is used).
-
+- Stored securely via `keyring` (no plaintext file)
+- Clear via OS credential manager if needed
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Chrome fails to start | Missing / incompatible driver | Delete driver cache; re-run (webdriver-manager will fetch). |
-| Empty listings repeatedly | Site not publishing new data yet | Keep window open; adaptive refresh slows polling when far from 20:00. |
-| Flood of HTTP logs | Debug mode on + body tracing | Disable via GUI or `client.set_debug(False)` / `set_http_body_trace(False)`. |
-| Tests hang | Browser starting during tests | Set `WOONNET_NO_BROWSER=1` or pass `enable_browser=False`. |
-
+| Chrome fails to start | Driver mismatch or blocked | Clear driver cache; ensure Chrome installed |
+| NO IMAGE thumbnails | 4xx / invalid content / auth | Check `qt_ui.log`; verify login state |
+| Gallery 520 failures | CDN edge responses | Navigate again; retries logged; potential future jitter backoff |
+| Excessive logs | Debug mode enabled | Disable via `client.set_debug(False)` |
+| Slow tests | Browser spawning | Use `WOONNET_NO_BROWSER=1` |
 ## Contributing
 
-Pull requests welcome. Please:
-
-1. Add / update tests for behavioral changes.
-2. Run `pytest -q` (with `WOONNET_NO_BROWSER=1`).
-3. Keep UI / core separation: no Selenium or HTTP logic inside `ui/`.
-4. Avoid leaking secrets—Discord reporting uses a proxy; do not hardcode webhooks.
-
----
-
-If any step here seems outdated or unclear, open an issue so the README stays accurate.
-
+1. Add / update tests for behavioral changes
+2. Run tests headless (`WOONNET_NO_BROWSER=1`)
+3. Keep UI vs core separation (no Selenium in `ui_qt/`)
+4. Don’t hardcode secrets / webhooks
 ## Automated Builds
 
-If you rely on GitHub Actions releases, ensure the workflow now invokes `python main.py` (or module `ui.app`). Update the spec file if needed to reflect new imports.
-
+Configure CI to run tests with `WOONNET_NO_BROWSER=1` and build with PyInstaller targeting `main.py`.
 ## Disclaimer
 
-Use responsibly. Respect site terms of service. No guarantees of availability or correctness.
+Use responsibly. Respect site terms of service. No guarantees of availability, stability, or correctness.

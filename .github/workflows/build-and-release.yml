@@ -2,17 +2,15 @@ name: Build and Release Executable
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
       contents: write
-
     steps:
-      - name: Check out code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -27,111 +25,76 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # NEW: Download the latest stable chromedriver for Windows
       - name: Download Chromedriver
+        shell: pwsh
         run: |
-          # Fetch the latest stable chromedriver version and URL from the new JSON endpoints
           $LATEST_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
           $Response = Invoke-RestMethod -Uri $LATEST_URL
           $ChromedriverUrl = $Response.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' } | Select-Object -ExpandProperty url
-          
-          # Download and unzip
           Invoke-WebRequest -Uri $ChromedriverUrl -OutFile chromedriver.zip
           Expand-Archive -Path chromedriver.zip -DestinationPath .
-          
-          # Move chromedriver.exe to the root directory where the .spec file expects it
           Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe" -Force
 
-      # Build one-dir distribution using spec (no embedded chromedriver)
-      - name: Build (one-dir)
-        run: pyinstaller WoonnetRijnmondBot.spec
+      - name: Build executable
+        run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
 
-      # Optional VirusTotal scan (requires VIRUSTOTAL_API_KEY secret)
       - name: VirusTotal Scan
         id: vt_scan
+        if: ${{ secrets.VIRUSTOTAL_API_KEY != '' }}
         shell: pwsh
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
         run: |
-          if (-not $Env:VT_API_KEY) { Write-Host 'No VirusTotal API key provided. Skipping scan.'; exit 0 }
-          $ErrorActionPreference = 'Stop'
-          # Locate executable (support one-dir or legacy one-file path)
-          $exeCandidates = @(
-            "dist/WoonnetRijnmondBot/WoonnetRijnmondBot.exe",
-            "dist/WoonnetRijnmondBot.exe"
-          )
-          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $exePath) { throw "Executable not found in candidates: $($exeCandidates -join ', ')" }
+          $exePath = "dist/WoonnetRijnmondBot.exe"
+          if (-not (Test-Path $exePath)) { throw "EXE not found at $exePath" }
           $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
           $sha256 = $hashObj.Hash.ToLower()
-          Write-Host "SHA256: $sha256"
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
-          $allowMalicious = @('Bkav','APEX','Jiangmin')  # known benign FPs
-          $maxUnexpectedMalicious = 0
-
-          # Try to fetch existing report first
-          try {
-            $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
-          } catch { $report = $null }
-
+          try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           if (-not $report) {
-            $fileSize = (Get-Item $exePath).Length
-            if ($fileSize -gt 33554432) {
-              Write-Host "File >32MB, requesting large file upload URL"
-              $uploadUrlResp = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/upload_url" -Headers $headers
-              $uploadUrl = $uploadUrlResp.data
-              Write-Host "Uploading via large file URL"
-              curl -s -X POST "$uploadUrl" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
-            } else {
-              Write-Host "Standard upload (<32MB)"
-              curl -s -X POST "https://www.virustotal.com/api/v3/files" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
-            }
-            if (-not (Test-Path upload.json)) { throw "Upload response missing" }
+            curl -s -X POST "https://www.virustotal.com/api/v3/files" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
+            if (-not (Test-Path upload.json)) { throw 'Upload failed' }
             $upload = Get-Content upload.json | ConvertFrom-Json
             $analysisId = $upload.data.id
-            Write-Host "Submitted for analysis: $analysisId"
-            $maxAttempts = 18
-            for ($i=0; $i -lt $maxAttempts; $i++) {
+            for ($i=0; $i -lt 18; $i++) {
               Start-Sleep -Seconds 10
               $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
-              $status = $analysis.data.attributes.status
-              Write-Host "Analysis status: $status ($($i+1)/$maxAttempts)"
-              if ($status -eq 'completed') { break }
+              if ($analysis.data.attributes.status -eq 'completed') { break }
             }
-            # Retrieve final report after analysis
             try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           }
-
-          if (-not $report) { throw "Unable to retrieve VirusTotal report." }
+          if (-not $report) { throw 'No report' }
           $stats = $report.data.attributes.last_analysis_stats
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
-          $permalink = "https://www.virustotal.com/gui/file/$sha256"
-          Write-Host $summary
-          Write-Host "Report URL: $permalink"
-          # Build detailed flagged engines list & ratio
-          $results = $report.data.attributes.last_analysis_results
-          $allEngines = $results.PSObject.Properties.Name
-          $flagged = @()
-          foreach ($engineKey in $allEngines) {
-            $entry = $results.$engineKey
-            if ($entry.category -in 'malicious','suspicious') {
-              $flagged += [PSCustomObject]@{engine=$entry.engine_name; category=$entry.category; result=$entry.result}
-            }
-          }
-          $flaggedCount = $flagged.Count
-          $totalEngines = $allEngines.Count
-          $ratio = "$flaggedCount/$totalEngines"
-          Write-Host "Detection ratio: $ratio"
-          # Extended relationships (YARA / Sigma)
-          try {
-            $ext = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256?relationships=crowdsourced_yara_results,sigma_analysis_results" -Headers $headers -ErrorAction Stop
-          } catch { $ext = $null }
-          $yara = @(); $sigma = @()
-          if ($ext) {
-            if ($ext.data.attributes.crowdsourced_yara_results) { $yara = $ext.data.attributes.crowdsourced_yara_results }
-            if ($ext.data.attributes.sigma_analysis_results) { $sigma = $ext.data.attributes.sigma_analysis_results }
-          }
-          $yaraSummary = if ($yara.Count -gt 0) { $yara | ForEach-Object { "- $($_.rule_name): $($_.description)" } } else { @('None') }
+          "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release ${{ github.run_number }}
+          body: |
+            Automated release for commit ${{ github.sha }}.
+            This build includes the WoonnetRijnmondBot application.
+            SHA256: ${{ steps.vt_scan.outputs.sha256 }}
+            Summary: ${{ steps.vt_scan.outputs.summary }}
+            (If blank, VirusTotal scan was skipped.)
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/WoonnetRijnmondBot.exe
+          asset_name: WoonnetRijnmondBot.exe
+          asset_content_type: application/octet-stream
           $sigmaSummary = if ($sigma.Count -gt 0) { $sigma | ForEach-Object { "- $($_.rule_title) ($($_.level))" } } else { @('None') }
           # Allowlist enforcement
           $unexpected = $flagged | Where-Object { $_.category -eq 'malicious' -and ($allowMalicious -notcontains $_.engine) }
@@ -170,7 +133,7 @@ jobs:
             vt_report.json
             vt_report.md
 
-      - name: Create GitHub Release
+  - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
         env:
@@ -181,11 +144,12 @@ jobs:
           body: |
             Automated release for commit ${{ github.sha }}.
             This build includes the WoonnetRijnmondBot application.
-            SHA256: ${{ steps.vt_scan.outputs.sha256 }}
-            ${{ steps.vt_scan.outputs.summary }}
-            Report: ${{ steps.vt_scan.outputs.permalink }}
-            Detection Ratio: ${{ steps.vt_scan.outputs.ratio }}
-            Flagged Engines: ${{ steps.vt_scan.outputs.flagged_engines }}
+    SHA256: ${{ steps.vt_scan.outputs.sha256 }}
+    ${% raw %}{{ steps.vt_scan.outputs.summary }}{% endraw %}
+    (If values are blank the VirusTotal step was skipped.)
+    Report: ${{ steps.vt_scan.outputs.permalink }}
+    Detection Ratio: ${{ steps.vt_scan.outputs.ratio }}
+    Flagged Engines: ${{ steps.vt_scan.outputs.flagged_engines }}
           draft: false
           prerelease: false
 

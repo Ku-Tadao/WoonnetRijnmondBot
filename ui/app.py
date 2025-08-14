@@ -87,7 +87,9 @@ class ListingCard(ttk.Frame):
 class App(ttk.Window):
 	def __init__(self):
 		super().__init__(themename='litera', title=f'Woonnet Bot v{APP_VERSION}', size=(720,820), minsize=(640,540))
-		self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(2, weight=1)
+		self.grid_columnconfigure(0, weight=1)
+		# Row 1 hosts main body (listings). Give it weight so it expands; previous code mistakenly weighted row 2 (empty), causing poor resize behavior.
+		self.grid_rowconfigure(1, weight=1)
 		self.status_queue = Queue(); self.cards = []; self.api_session = None
 		self.selection_var = tk.StringVar(value='No listings loaded')
 		self.placeholder = placeholder_photo()
@@ -96,9 +98,15 @@ class App(ttk.Window):
 		except Exception: pass
 		threading.Thread(target=self.bot.start_headless_browser, daemon=True).start()
 		self._build_menu(); self._build_header(); self._build_body(); self.load_credentials()
+		# Metrics UI elements
+		self.metrics_enabled = tk.BooleanVar(value=True)
+		self.metrics_var = tk.StringVar(value='')
+		self.metrics_label = ttk.Label(self, textvariable=self.metrics_var, font=('Consolas',9))
+		self.metrics_label.grid(row=4, column=0, sticky=EW, padx=12, pady=(0,6)) # type: ignore
 		self.set_controls('initial'); self.after(120, self.pump_status); self.after(60000, self.scheduled_refresh_check)
 		self.after(5000, self._auto_refresh_loop)
 		self._last_change_timestamp = None
+		self.after(1500, self._metrics_loop)
 
 	def _build_menu(self):
 		m = tk.Menu(self)
@@ -106,6 +114,9 @@ class App(ttk.Window):
 		m.add_cascade(label='File', menu=file_menu)
 		self.debug_var = tk.BooleanVar(value=False)
 		view_menu = tk.Menu(m, tearoff=0); view_menu.add_checkbutton(label='Debug Mode', variable=self.debug_var, command=self._toggle_debug)
+		view_menu.add_checkbutton(label='Show Metrics', variable=getattr(self, 'metrics_enabled', tk.BooleanVar(value=True)), command=lambda: None)
+		self.fast_scroll_var = tk.BooleanVar(value=True)
+		view_menu.add_checkbutton(label='Fast Scroll', variable=self.fast_scroll_var, command=self._configure_scroll)
 		m.add_cascade(label='View', menu=view_menu)
 		help_menu = tk.Menu(m, tearoff=0); help_menu.add_command(label='Open Logs', command=lambda: os.startfile(APP_DIR)); help_menu.add_command(label='About', command=self._about)
 		m.add_cascade(label='Help', menu=help_menu); self.config(menu=m)
@@ -131,6 +142,7 @@ class App(ttk.Window):
 		ttk.Button(bar, text='Clear', command=self._clear_selection, bootstyle='secondary-outline').pack(side='right', padx=2) # type: ignore
 		lst_frame = ttk.Labelframe(body, text='Listings', padding=4); lst_frame.pack(fill=BOTH, expand=True); lst_frame.grid_columnconfigure(0, weight=1); lst_frame.grid_rowconfigure(0, weight=1)
 		self.scroller = ScrolledFrame(lst_frame, autohide=True); self.scroller.grid(row=0, column=0, sticky=NSEW)
+		self._configure_scroll()  # set initial scroll speed
 		stat = ttk.Labelframe(self, text='Status & Log', padding=(10,6)); stat.grid(row=3, column=0, sticky=NSEW, padx=12, pady=(0,12)); stat.grid_columnconfigure(0, weight=1); stat.grid_rowconfigure(1, weight=1)
 		self.status_label = ttk.Label(stat, text='Starting browser...', anchor=W); self.status_label.grid(row=0,column=0,sticky=EW)
 		self.log_text = tk.Text(stat, height=7, wrap='word', state='disabled', font=('Consolas',9)); self.log_text.grid(row=1,column=0,sticky=NSEW,pady=(6,4))
@@ -229,6 +241,51 @@ class App(ttk.Window):
 
 	def _toggle_debug(self):
 		self.bot.set_debug(bool(self.debug_var.get()))
+		if self.debug_var.get():
+			self._append_log('Debug instrumentation ON')
+		else:
+			self._append_log('Debug instrumentation off')
+
+	def _configure_scroll(self):
+		"""Configure/adjust mouse wheel scroll speed for the listings scroller.
+
+		Fast mode scrolls 3 * system notch; normal mode uses 1.
+		"""
+		try:
+			canvas = getattr(self.scroller, '_canvas', None)
+			if not canvas:
+				return
+			for seq in ("<MouseWheel>",):
+				canvas.unbind(seq)
+				self.scroller.unbind(seq)
+			factor = 3 if self.fast_scroll_var.get() else 1
+			def _on_wheel(e, f=factor):
+				# Windows: event.delta is ±120 per notch
+				units = int(-1 * (e.delta / 120) * f)
+				try:
+					canvas.yview_scroll(units, 'units')
+					return 'break'
+				except Exception:
+					return
+			canvas.bind("<MouseWheel>", _on_wheel, add='+')
+			self.scroller.bind("<MouseWheel>", _on_wheel, add='+')
+		except Exception:
+			pass
+
+	def _metrics_loop(self):
+		try:
+			if self.metrics_enabled.get():
+				m = self.bot.get_metrics()
+				self.metrics_var.set(
+					f"HTTP {m['http_requests']} req ({m['http_errors']} err) avg {m['avg_http_ms']:.0f}ms | "
+					f"Disc#{m['discovery_runs']} last {m['last_discovery_ms']:.0f}ms +{m['last_change_new']}/-{m['last_change_disappeared']} "
+					f"Listings {m['last_listings_processed']} det_avg {m['avg_detail_fetch_ms']:.0f}ms | Apply {m['apply_success']}/{m['apply_attempts']}"
+				)
+			else:
+				self.metrics_var.set('')
+		except Exception:
+			pass
+		self.after(1500, self._metrics_loop)
 
 	def _auto_refresh_loop(self):
 		now = datetime.now(); minutes_to_target = max(0, APPLICATION_HOUR * 60 - (now.hour * 60 + now.minute))

@@ -55,7 +55,7 @@ class WoonnetClient:
     """
     def __init__(
         self,
-        status_queue: Queue,
+        status_queue: Queue | None,
         logger: logging.Logger,
         log_file_path: str,
         *,
@@ -77,6 +77,22 @@ class WoonnetClient:
         self.cache_path = None
         self._orig_request_func = None
         self.max_workers = max(1, max_workers)
+        # Metrics (thread-safe counters)
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            'http_requests': 0,
+            'http_errors': 0,
+            'http_total_ms': 0.0,
+            'discovery_runs': 0,
+            'last_discovery_ms': 0.0,
+            'last_change_new': 0,
+            'last_change_disappeared': 0,
+            'last_listings_processed': 0,
+            'detail_fetch_total_ms': 0.0,
+            'detail_fetch_items': 0,
+            'apply_attempts': 0,
+            'apply_success': 0,
+        }
         # Respect env override
         if os.environ.get("WOONNET_NO_BROWSER") == "1":
             enable_browser = False
@@ -126,7 +142,11 @@ class WoonnetClient:
 
     # --- Logging helpers ---
     def _log(self, message: str, level: str = 'info') -> None:
-        self.status_queue.put_nowait(message)
+        if self.status_queue is not None:
+            try:
+                self.status_queue.put_nowait(message)
+            except Exception:
+                pass
         getattr(self.logger, level, self.logger.info)(message)
 
     def _report_error(self, e: Exception, context: str) -> None:
@@ -158,8 +178,15 @@ class WoonnetClient:
             except Exception as exc:
                 dur = (time.perf_counter() - start) * 1000
                 client._log(f"[HTTP !!] {method.upper()} {url} failed after {dur:.1f} ms: {exc}", 'error')
+                with client._metrics_lock:
+                    client._metrics['http_requests'] += 1
+                    client._metrics['http_errors'] += 1
+                    client._metrics['http_total_ms'] += dur
                 raise
             dur = (time.perf_counter() - start) * 1000
+            with client._metrics_lock:
+                client._metrics['http_requests'] += 1
+                client._metrics['http_total_ms'] += dur
             if client.debug:
                 ct = resp.headers.get('Content-Type', '')
                 size = len(resp.content or b'')
@@ -276,17 +303,20 @@ class WoonnetClient:
         if not self.is_logged_in:
             self._log("Not logged in.", 'error'); return []
         self._log("Discovering listings via API...")
+        overall_start = time.perf_counter()
         try:
             payload = {
                 "woonwens": {"Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")},
                 "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag"
             }
-            if self.debug: self._log(f"[DISCOVER] POST {API_DISCOVERY_URL} payload={payload}")
+            if self.debug:
+                self._log(f"[DISCOVER] POST {API_DISCOVERY_URL} payload={payload}")
             response = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15)
             response.raise_for_status()
             data = response.json()
             initial_listings = data.get('d', {}).get('resultaten', [])
-            if self.debug: self._log(f"Discovery HTTP {response.status_code}; raw count={len(initial_listings)}")
+            if self.debug:
+                self._log(f"Discovery HTTP {response.status_code}; raw count={len(initial_listings)}")
             current_ids = {r.get('FrontendAdvertentieId') for r in initial_listings if r.get('FrontendAdvertentieId')}
             if not current_ids:
                 self._empty_runs += 1
@@ -304,6 +334,9 @@ class WoonnetClient:
             self._last_listing_ids = current_ids
             self._empty_runs = 0
             self._log(f"Change detected: +{len(new_ids)} / -{len(disappeared)} (total {len(current_ids)}). Fetching details...")
+            with self._metrics_lock:
+                self._metrics['last_change_new'] = len(new_ids)
+                self._metrics['last_change_disappeared'] = len(disappeared)
             self._persist_ids()
         except Exception as e:
             self._report_error(e, "during API listing discovery")
@@ -329,8 +362,19 @@ class WoonnetClient:
                         start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else f"{APPLICATION_HOUR}:00"
                         status_text = f"SELECTABLE ({start_time_str})" if is_in_window else f"PREVIEW ({start_time_str})"
                     can_select = is_live or is_in_window
-                    main_photo = next((m for m in item.get('media', []) if m.get('type') == 'StraatFoto'), None)
+                    media_items = item.get('media', []) or []
+                    main_photo = next((m for m in media_items if m.get('type') == 'StraatFoto'), None)
                     image_url = f"https:{main_photo['fotoviewer']}" if main_photo and main_photo.get('fotoviewer') else None
+                    # Collect additional images (unique order preserved) – cap to first 8 for performance
+                    image_urls: list[str] = []
+                    for m in media_items:
+                        fv = m.get('fotoviewer')
+                        if fv:
+                            full = f"https:{fv}" if fv.startswith("//") else fv
+                            if full not in image_urls:
+                                image_urls.append(full)
+                        if len(image_urls) >= 8:
+                            break
                     processed.append({
                         'id': item.get('id'),
                         'address': f"{item.get('straat','')} {item.get('huisnummer','')}",
@@ -339,15 +383,27 @@ class WoonnetClient:
                         'price_float': self._parse_price(item.get('kalehuur','')),
                         'status_text': status_text,
                         'is_selectable': can_select,
-                        'image_url': image_url
+                        'image_url': image_url,
+                        'image_urls': image_urls
                     })
+                    with self._metrics_lock:
+                        self._metrics['detail_fetch_items'] += 1
                 except Exception as e:
                     self._report_error(e, f"processing details for listing ID {future_to_id[future]}")
         self._log(f"Processed {len(processed)} listings.")
+        elapsed_ms = (time.perf_counter() - overall_start) * 1000
+        with self._metrics_lock:
+            self._metrics['discovery_runs'] += 1
+            self._metrics['last_discovery_ms'] = elapsed_ms
+            self._metrics['last_listings_processed'] = len(processed)
+        if self.debug:
+            avg_http = (self._metrics['http_total_ms'] / self._metrics['http_requests']) if self._metrics['http_requests'] else 0.0
+            self._log(f"[DISCOVER] Duration {elapsed_ms:.1f} ms avg_http={avg_http:.1f} ms")
         return sorted(processed, key=lambda x: x['price_float'])
 
     def get_listing_details(self, listing_id: str) -> Optional[Dict]:
         payload = {"Id": listing_id, "VolgendeId": 0, "Filters": "gebruik!=Complex|nieuwab==True", "inschrijfnummerTekst": "", "Volgorde": "", "hash": ""}
+        start = time.perf_counter()
         try:
             response = self.session.post(API_DETAILS_SINGLE_URL, json=payload, timeout=10)
             response.raise_for_status()
@@ -355,6 +411,10 @@ class WoonnetClient:
         except requests.RequestException:
             self._log(f"Could not get details for listing {listing_id}", 'warning')
             return None
+        finally:
+            dur = (time.perf_counter() - start) * 1000
+            with self._metrics_lock:
+                self._metrics['detail_fetch_total_ms'] += dur
 
     # --- Apply Workflow ---
     def _get_server_countdown_seconds(self) -> Optional[float]:
@@ -416,6 +476,8 @@ class WoonnetClient:
             for f in as_completed(futures):
                 if f.result():
                     success += 1
+                with self._metrics_lock:
+                    self._metrics['apply_attempts'] += 1
         self._log(f"Finished. Applied to {success} of {len(listing_ids)} selected listings.")
 
     def _extract_postable_form(self, html: str, base_url: str) -> Tuple[Optional[str], dict]:
@@ -534,6 +596,15 @@ class WoonnetClient:
     def set_http_body_trace(self, enabled: bool) -> None:
         self.trace_http_bodies = enabled
         self._log(f"HTTP body tracing {'ENABLED' if enabled else 'disabled'}.")
+
+    # --- Metrics API ---
+    def get_metrics(self) -> Dict[str, Any]:
+        """Snapshot of internal metrics with derived averages for UI display."""
+        with self._metrics_lock:
+            snap = dict(self._metrics)
+        snap['avg_http_ms'] = (snap['http_total_ms'] / snap['http_requests']) if snap['http_requests'] else 0.0
+        snap['avg_detail_fetch_ms'] = (snap['detail_fetch_total_ms'] / snap['detail_fetch_items']) if snap['detail_fetch_items'] else 0.0
+        return snap
 
     # --- Shutdown ---
     def quit(self) -> None:
