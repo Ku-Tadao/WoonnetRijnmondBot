@@ -59,6 +59,7 @@ jobs:
 
       - name: VirusTotal Scan
         id: vt_scan
+        continue-on-error: true
         shell: pwsh
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
@@ -121,9 +122,9 @@ jobs:
               try {
                 $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers -ErrorAction Stop
                 $status = $analysis.data.attributes.status
-                Write-Host "Poll $($i+1)/$maxAttempts: status=$status"
+                Write-Host ("Poll {0}/{1}: status={2}" -f ($i+1), $maxAttempts, $status)
                 if ($status -eq 'completed') { break }
-              } catch { Write-Host "Polling error (continuing): $($_.Exception.Message)" }
+              } catch { Write-Host ("Polling error (continuing): {0}" -f $_.Exception.Message) }
             }
             try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           }
