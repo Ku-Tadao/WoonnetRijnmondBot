@@ -54,25 +54,70 @@ jobs:
             '# VirusTotal Summary`n`nScan skipped (no API key).' | Out-File vt_report.md -Encoding UTF8
             exit 0
           }
-          $exePath = "dist/WoonnetRijnmondBot.exe"
-          if (-not (Test-Path $exePath)) { throw "EXE not found at $exePath" }
+          # Determine executable path (support one-file and one-dir builds)
+          $exeCandidates = @(
+            "dist/WoonnetRijnmondBot.exe",
+            "dist/WoonnetRijnmondBot/WoonnetRijnmondBot.exe"
+          )
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exePath) { throw "Executable not found. Looked in: $($exeCandidates -join ', ')" }
           $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
-            $sha256 = $hashObj.Hash.ToLower()
+          $sha256 = $hashObj.Hash.ToLower()
+          Write-Host "SHA256: $sha256"
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
-          try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
+          # Try to get existing report (avoid re-upload if already scanned)
+          try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop; Write-Host 'Existing report found.' } catch { $report = $null }
           if (-not $report) {
-            curl -s -X POST "https://www.virustotal.com/api/v3/files" -H "x-apikey: $Env:VT_API_KEY" -F "file=@$exePath" -o upload.json
-            if (-not (Test-Path upload.json)) { throw 'Upload failed' }
-            $upload = Get-Content upload.json | ConvertFrom-Json
-            $analysisId = $upload.data.id
-            for ($i=0; $i -lt 18; $i++) {
+            $fileSize = (Get-Item $exePath).Length
+            $sizeMB = [Math]::Round($fileSize/1MB,2)
+            Write-Host "Uploading file ($sizeMB MB) to VirusTotal..."
+            try {
+              if ($fileSize -le 33554432) { # <=32MB standard endpoint
+                $uploadResp = Invoke-RestMethod -Method Post -Uri "https://www.virustotal.com/api/v3/files" -Headers $headers -Form @{ file = Get-Item $exePath } -ErrorAction Stop
+              } else {
+                Write-Host 'Requesting large file upload URL (file > 32MB).'
+                $largeUrlResp = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/upload_url" -Headers $headers -ErrorAction Stop
+                $uploadUrl = $largeUrlResp.data
+                $uploadResp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -Form @{ file = Get-Item $exePath } -ErrorAction Stop
+              }
+            } catch {
+              Write-Host "::error ::VirusTotal upload failed: $($_.Exception.Message)"
+              'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              'summary=VirusTotal upload failed' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              '{"error":"upload_failed"}' | Out-File vt_report.json -Encoding UTF8
+              '# VirusTotal Summary`n`nUpload failed.' | Out-File vt_report.md -Encoding UTF8
+              exit 0
+            }
+            if (-not $uploadResp -or -not $uploadResp.data.id) {
+              Write-Host '::error ::No analysis ID returned from upload.'
+              'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              'summary=VirusTotal upload returned no analysis ID' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              '{"error":"no_analysis_id"}' | Out-File vt_report.json -Encoding UTF8
+              '# VirusTotal Summary`n`nNo analysis ID returned.' | Out-File vt_report.md -Encoding UTF8
+              exit 0
+            }
+            $analysisId = $uploadResp.data.id
+            Write-Host "Analysis ID: $analysisId"
+            $maxAttempts = 24
+            for ($i=0; $i -lt $maxAttempts; $i++) {
               Start-Sleep -Seconds 10
-              $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
-              if ($analysis.data.attributes.status -eq 'completed') { break }
+              try {
+                $analysis = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers -ErrorAction Stop
+                $status = $analysis.data.attributes.status
+                Write-Host "Poll $($i+1)/$maxAttempts: status=$status"
+                if ($status -eq 'completed') { break }
+              } catch { Write-Host "Polling error (continuing): $($_.Exception.Message)" }
             }
             try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           }
-          if (-not $report) { throw 'No report' }
+          if (-not $report) {
+            Write-Host '::warning ::No report available after upload/poll.'
+            "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "summary=VirusTotal scan unavailable" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            '{"error":"no_report"}' | Out-File vt_report.json -Encoding UTF8
+            "# VirusTotal Summary`n`nNo report available." | Out-File vt_report.md -Encoding UTF8
+            exit 0
+          }
           $stats = $report.data.attributes.last_analysis_stats
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
