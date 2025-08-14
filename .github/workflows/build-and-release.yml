@@ -40,6 +40,23 @@ jobs:
         shell: pwsh
         run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
 
+      - name: Artifact metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $exeCandidates = @(
+            "dist/WoonnetRijnmondBot.exe",
+            "dist/WoonnetRijnmondBot/WoonnetRijnmondBot.exe"
+          )
+            $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exePath) { Write-Host '::warning ::Executable not found for metadata.' } else {
+            $sizeBytes = (Get-Item $exePath).Length
+            $sizeMB = [Math]::Round($sizeBytes/1MB,2)
+            Write-Host "Artifact: $exePath ($sizeMB MB)"
+            "exe_path=$exePath" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "exe_size_mb=$sizeMB" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          }
+
       - name: VirusTotal Scan
         id: vt_scan
         shell: pwsh
@@ -122,6 +139,11 @@ jobs:
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_harmless=$($stats.harmless)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_undetected=$($stats.undetected)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_suspicious=$($stats.suspicious)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_malicious=$($stats.malicious)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_timeout=$($stats.timeout)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           $report | ConvertTo-Json -Depth 8 | Out-File vt_report.json -Encoding UTF8
           "# VirusTotal Summary`n`n$summary" | Out-File vt_report.md -Encoding UTF8
 
@@ -134,11 +156,45 @@ jobs:
           tag_name: v${{ github.run_number }}
           release_name: Release ${{ github.run_number }}
           body: |
-            Automated release for commit ${{ github.sha }}.
-            This build includes the WoonnetRijnmondBot application.
-            SHA256: ${{ steps.vt_scan.outputs.sha256 }}
-            Summary: ${{ steps.vt_scan.outputs.summary }}
-            (If blank, VirusTotal scan was skipped.)
+            ## WoonnetRijnmondBot Release v${{ github.run_number }}
+
+            Commit: `${{ github.sha }}`  
+            Branch: `${{ github.ref_name }}`  
+            Triggered by: `${{ github.actor }}`  
+
+            ### Artifact
+            Path: `${{ steps.meta.outputs.exe_path }}`  
+            Size: `${{ steps.meta.outputs.exe_size_mb }}` MB  
+            SHA256: `${{ steps.vt_scan.outputs.sha256 }}`
+
+            ### VirusTotal Summary
+            ${{ steps.vt_scan.outputs.summary }}
+
+            | Harmless | Undetected | Suspicious | Malicious | Timeout |
+            |----------|------------|------------|-----------|---------|
+            | ${{ steps.vt_scan.outputs.vt_harmless || '—' }} | ${{ steps.vt_scan.outputs.vt_undetected || '—' }} | ${{ steps.vt_scan.outputs.vt_suspicious || '—' }} | ${{ steps.vt_scan.outputs.vt_malicious || '—' }} | ${{ steps.vt_scan.outputs.vt_timeout || '—' }} |
+
+            Notes:
+            - If the table shows em-dashes, the VirusTotal scan was skipped or unavailable.
+            - Large files (>32MB) use the large upload endpoint; polling may take several minutes.
+
+            ### Usage
+            1. Download `WoonnetRijnmondBot.exe` (or the zip) from the Assets section.
+            2. Place your configuration (if required) alongside the executable.
+            3. Run the executable. The PySide6 UI will launch.
+
+            ### Changes
+            - Automated build process executed successfully.
+            - See commit diff for exact source changes included in this build.
+
+            ### Integrity
+            You can verify integrity with:
+            ```powershell
+            Get-FileHash -Algorithm SHA256 .\WoonnetRijnmondBot.exe
+            ```
+
+            ---
+            _Generated automatically by GitHub Actions._
           draft: false
           prerelease: false
 
