@@ -220,7 +220,21 @@ jobs:
       - name: Archive dist folder
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/WoonnetRijnmondBot/* -DestinationPath WoonnetRijnmondBot.zip
+          $oneDir = 'dist/WoonnetRijnmondBot'
+          $oneFile = 'dist/WoonnetRijnmondBot.exe'
+          if (Test-Path $oneDir) {
+            Write-Host 'Archiving one-dir distribution.'
+            if (Test-Path WoonnetRijnmondBot.zip) { Remove-Item WoonnetRijnmondBot.zip -Force }
+            Compress-Archive -Path $oneDir -DestinationPath WoonnetRijnmondBot.zip
+          } elseif (Test-Path $oneFile) {
+            Write-Host 'Archiving single executable.'
+            if (Test-Path WoonnetRijnmondBot.zip) { Remove-Item WoonnetRijnmondBot.zip -Force }
+            Compress-Archive -Path $oneFile -DestinationPath WoonnetRijnmondBot.zip
+          } else {
+            Write-Host '::error ::No build artifacts found to archive.'
+            Get-ChildItem -Recurse dist | Format-List || Write-Host 'dist directory listing failed.'
+            exit 1
+          }
 
       - name: Upload Release Asset (zip)
         uses: actions/upload-release-asset@v1
