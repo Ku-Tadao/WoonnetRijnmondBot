@@ -38,7 +38,7 @@ jobs:
 
       - name: Build executable
         shell: pwsh
-        run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
+        run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --add-data "ui_qt/theme.qss;ui_qt" --icon assets/icon.ico
 
       - name: Artifact metadata
         id: meta

@@ -6,6 +6,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets', 'assets'),
+        ('ui_qt/theme.qss', 'ui_qt'),  # ensure theme stylesheet packaged
     ],
     hiddenimports=[],
     hookspath=[],

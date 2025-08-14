@@ -529,12 +529,22 @@ class MainWindow(QMainWindow):
         self.worker.loggedIn.connect(self._on_logged_in)
 
     def _load_theme(self):
-        qss_path = os.path.join(os.path.dirname(__file__), 'theme.qss')
-        try:
-            with open(qss_path, 'r', encoding='utf-8') as f:
-                self.setStyleSheet(f.read())
-        except Exception:
-            pass
+        base_dir = os.path.dirname(__file__)
+        candidates = [
+            os.path.join(base_dir, 'theme.qss'),  # source layout
+            os.path.join(os.path.dirname(sys.executable), 'ui_qt', 'theme.qss'),  # one-file extracted
+            os.path.join(os.getcwd(), 'ui_qt', 'theme.qss'),  # current working dir
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        self.setStyleSheet(f.read())
+                    logger.debug(f"[THEME] Loaded stylesheet from {p}")
+                    return
+                except Exception as e:
+                    logger.debug(f"[THEME] Failed to load {p}: {e}")
+        logger.debug("[THEME] No stylesheet applied (all candidates missing)")
 
     # Actions ---------------------------------------------------------
     @Slot()
