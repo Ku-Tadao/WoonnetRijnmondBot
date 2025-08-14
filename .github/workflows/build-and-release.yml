@@ -39,17 +39,20 @@ jobs:
       - name: Build executable
         shell: pwsh
         run: |
+          $pyArgs = @(
+            '-F','main.py',
+            '-n','WoonnetRijnmondBot',
+            '--add-binary','chromedriver.exe;.',
+            '--add-data','ui_qt/theme.qss;ui_qt'
+          )
           if (Test-Path 'assets/icon.ico') {
-            # PyInstaller (current version in CI) only exposes the short -i form (no --icon long option in help output)
-            $iconArg = '-i assets/icon.ico'
+            Write-Host 'Using icon: assets/icon.ico'
+            $pyArgs += @('-i','assets/icon.ico')
           } else {
-            Write-Host 'Icon not found (assets/icon.ico); continuing without custom icon.'
-            $iconArg = ''
+            Write-Host 'Icon not found (assets/icon.ico); building without custom icon.'
           }
-          pyinstaller -F main.py -n WoonnetRijnmondBot `
-            --add-binary "chromedriver.exe;." `
-            --add-data "ui_qt/theme.qss;ui_qt" `
-            $iconArg
+          Write-Host ('Invoking PyInstaller with args: ' + ($pyArgs -join ' '))
+          pyinstaller @pyArgs
 
       - name: Artifact metadata
         id: meta
