@@ -9,6 +9,7 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,13 +63,15 @@ jobs:
             "dist/WoonnetRijnmondBot.exe",
             "dist/WoonnetRijnmondBot/WoonnetRijnmondBot.exe"
           )
-            $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $exePath) { Write-Host '::warning ::Executable not found for metadata.' } else {
-            $sizeBytes = (Get-Item $exePath).Length
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exePath) {
+            Write-Host '::warning ::Executable not found for metadata.'
+          } else {
+            $sizeBytes = (Get-Item -LiteralPath $exePath).Length
             $sizeMB = [Math]::Round($sizeBytes/1MB,2)
             Write-Host "Artifact: $exePath ($sizeMB MB)"
-            "exe_path=$exePath" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-            "exe_size_mb=$sizeMB" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "exe_path=$exePath"    | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "exe_size_mb=$sizeMB"  | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           }
 
       - name: VirusTotal Scan
@@ -78,14 +81,26 @@ jobs:
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
         run: |
+          function Write-DefaultVTOutputs {
+            param(
+              [string]$Sha256Value = ''
+            )
+            "sha256=$Sha256Value" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "vt_harmless=—"   | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "vt_undetected=—" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "vt_suspicious=—" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "vt_malicious=—"  | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            "vt_timeout=—"    | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          }
+
           if (-not $Env:VT_API_KEY) {
             Write-Host 'VirusTotal API key not provided; skipping scan.'
-            'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-            'summary=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            Write-DefaultVTOutputs
             '{}' | Out-File vt_report.json -Encoding UTF8
-            '# VirusTotal Summary`n`nScan skipped (no API key).' | Out-File vt_report.md -Encoding UTF8
+            "# VirusTotal Summary`n`nScan skipped (no API key)." | Out-File vt_report.md -Encoding UTF8
             exit 0
           }
+
           # Determine executable path (support one-file and one-dir builds)
           $exeCandidates = @(
             "dist/WoonnetRijnmondBot.exe",
@@ -93,43 +108,55 @@ jobs:
           )
           $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $exePath) { throw "Executable not found. Looked in: $($exeCandidates -join ', ')" }
-          $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
+
+          $hashObj = Get-FileHash -Algorithm SHA256 -LiteralPath $exePath
           $sha256 = $hashObj.Hash.ToLower()
           Write-Host "SHA256: $sha256"
+
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
+
           # Try to get existing report (avoid re-upload if already scanned)
-          try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop; Write-Host 'Existing report found.' } catch { $report = $null }
+          $report = $null
+          try {
+            $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
+            Write-Host 'Existing report found.'
+          } catch {}
+
+          $analysis = $null
+
           if (-not $report) {
-            $fileSize = (Get-Item $exePath).Length
+            $fileSize = (Get-Item -LiteralPath $exePath).Length
             $sizeMB = [Math]::Round($fileSize/1MB,2)
             Write-Host "Uploading file ($sizeMB MB) to VirusTotal..."
             try {
               if ($fileSize -le 33554432) { # <=32MB standard endpoint
-                $uploadResp = Invoke-RestMethod -Method Post -Uri "https://www.virustotal.com/api/v3/files" -Headers $headers -Form @{ file = Get-Item $exePath } -ErrorAction Stop
+                $uploadResp = Invoke-RestMethod -Method Post -Uri "https://www.virustotal.com/api/v3/files" -Headers $headers -Form @{ file = Get-Item -LiteralPath $exePath } -ErrorAction Stop
               } else {
-                Write-Host 'Requesting large file upload URL (file > 32MB).'
-                $largeUrlResp = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/upload_url" -Headers $headers -ErrorAction Stop
-                $uploadUrl = $largeUrlResp.data
-                $uploadResp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -Form @{ file = Get-Item $exePath } -ErrorAction Stop
+                Write-Host '::warning ::File >32MB; large-file upload requires VirusTotal premium/private API. Skipping scan.'
+                Write-DefaultVTOutputs -Sha256Value $sha256
+                '{ "skipped": "file_too_large_public_api" }' | Out-File vt_report.json -Encoding UTF8
+                "# VirusTotal Summary`n`nScan skipped: file >32MB on public API." | Out-File vt_report.md -Encoding UTF8
+                exit 0
               }
             } catch {
               Write-Host "::error ::VirusTotal upload failed: $($_.Exception.Message)"
-              'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-              'summary=VirusTotal upload failed' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              Write-DefaultVTOutputs -Sha256Value $sha256
               '{"error":"upload_failed"}' | Out-File vt_report.json -Encoding UTF8
-              '# VirusTotal Summary`n`nUpload failed.' | Out-File vt_report.md -Encoding UTF8
+              "# VirusTotal Summary`n`nUpload failed." | Out-File vt_report.md -Encoding UTF8
               exit 0
             }
+
             if (-not $uploadResp -or -not $uploadResp.data.id) {
               Write-Host '::error ::No analysis ID returned from upload.'
-              'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-              'summary=VirusTotal upload returned no analysis ID' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+              Write-DefaultVTOutputs -Sha256Value $sha256
               '{"error":"no_analysis_id"}' | Out-File vt_report.json -Encoding UTF8
-              '# VirusTotal Summary`n`nNo analysis ID returned.' | Out-File vt_report.md -Encoding UTF8
+              "# VirusTotal Summary`n`nNo analysis ID returned." | Out-File vt_report.md -Encoding UTF8
               exit 0
             }
+
             $analysisId = $uploadResp.data.id
             Write-Host "Analysis ID: $analysisId"
+
             $maxAttempts = 24
             for ($i=0; $i -lt $maxAttempts; $i++) {
               Start-Sleep -Seconds 10
@@ -138,27 +165,44 @@ jobs:
                 $status = $analysis.data.attributes.status
                 Write-Host ("Poll {0}/{1}: status={2}" -f ($i+1), $maxAttempts, $status)
                 if ($status -eq 'completed') { break }
-              } catch { Write-Host ("Polling error (continuing): {0}" -f $_.Exception.Message) }
+              } catch {
+                Write-Host ("Polling error (continuing): {0}" -f $_.Exception.Message)
+              }
             }
-            try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
+
+            try {
+              $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop
+            } catch {
+              $report = $null
+            }
           }
-          if (-not $report) {
-            Write-Host '::warning ::No report available after upload/poll.'
-            "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-            "summary=VirusTotal scan unavailable" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+
+          # Prefer the file report; fall back to analysis stats (propagation lag handling)
+          $stats = $null
+          if ($report -and $report.data.attributes.last_analysis_stats) {
+            $stats = $report.data.attributes.last_analysis_stats
+          } elseif ($analysis -and $analysis.data.attributes.stats) {
+            $stats = $analysis.data.attributes.stats
+          }
+
+          if (-not $stats) {
+            Write-Host '::warning ::No report available after upload/poll (propagation?).'
+            Write-DefaultVTOutputs -Sha256Value $sha256
             '{"error":"no_report"}' | Out-File vt_report.json -Encoding UTF8
             "# VirusTotal Summary`n`nNo report available." | Out-File vt_report.md -Encoding UTF8
             exit 0
           }
-          $stats = $report.data.attributes.last_analysis_stats
+
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
+
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "vt_harmless=$($stats.harmless)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_harmless=$($stats.harmless)"     | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "vt_undetected=$($stats.undetected)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "vt_suspicious=$($stats.suspicious)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "vt_malicious=$($stats.malicious)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "vt_timeout=$($stats.timeout)" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_malicious=$($stats.malicious)"   | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          "vt_timeout=$($stats.timeout)"       | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+
           $report | ConvertTo-Json -Depth 8 | Out-File vt_report.json -Encoding UTF8
           "# VirusTotal Summary`n`n$summary" | Out-File vt_report.md -Encoding UTF8
 
@@ -188,6 +232,7 @@ jobs:
             Get-ChildItem -Recurse dist | Format-List || Write-Host 'dist directory listing failed.'
             exit 1
           }
+
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -197,13 +242,13 @@ jobs:
           body: |
             ## WoonnetRijnmondBot Release v${{ github.run_number }}
 
-            Commit: `${{ github.sha }}`  
-            Branch: `${{ github.ref_name }}`  
-            Triggered by: `${{ github.actor }}`  
+            Commit: `${{ github.sha }}`
+            Branch: `${{ github.ref_name }}`
+            Triggered by: `${{ github.actor }}`
 
             ### Artifact
-            Path: `${{ steps.meta.outputs.exe_path }}`  
-            Size: `${{ steps.meta.outputs.exe_size_mb }}` MB  
+            Path: `${{ steps.meta.outputs.exe_path }}`
+            Size: `${{ steps.meta.outputs.exe_size_mb }} MB`
             SHA256: `${{ steps.vt_scan.outputs.sha256 }}`
 
             ### VirusTotal Summary
@@ -211,11 +256,11 @@ jobs:
 
             | Harmless | Undetected | Suspicious | Malicious | Timeout |
             |----------|------------|------------|-----------|---------|
-            | ${{ steps.vt_scan.outputs.vt_harmless || '—' }} | ${{ steps.vt_scan.outputs.vt_undetected || '—' }} | ${{ steps.vt_scan.outputs.vt_suspicious || '—' }} | ${{ steps.vt_scan.outputs.vt_malicious || '—' }} | ${{ steps.vt_scan.outputs.vt_timeout || '—' }} |
+            | ${{ steps.vt_scan.outputs.vt_harmless }} | ${{ steps.vt_scan.outputs.vt_undetected }} | ${{ steps.vt_scan.outputs.vt_suspicious }} | ${{ steps.vt_scan.outputs.vt_malicious }} | ${{ steps.vt_scan.outputs.vt_timeout }} |
 
             Notes:
             - If the table shows em-dashes, the VirusTotal scan was skipped or unavailable.
-            - Large files (>32MB) use the large upload endpoint; polling may take several minutes.
+            - Large files (>32MB) use a premium-only large upload endpoint; scans will be skipped on public API.
 
             ### Usage
             1. Download `WoonnetRijnmondBot.exe` (or the zip) from the Assets section.
