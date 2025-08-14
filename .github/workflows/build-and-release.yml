@@ -20,6 +20,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -36,19 +37,27 @@ jobs:
           Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe" -Force
 
       - name: Build executable
+        shell: pwsh
         run: pyinstaller -F main.py -n WoonnetRijnmondBot --add-binary "chromedriver.exe;." --icon assets/icon.ico
 
       - name: VirusTotal Scan
         id: vt_scan
-        if: ${{ secrets.VIRUSTOTAL_API_KEY != '' }}
         shell: pwsh
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
         run: |
+          if (-not $Env:VT_API_KEY) {
+            Write-Host 'VirusTotal API key not provided; skipping scan.'
+            'sha256=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            'summary=' | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+            '{}' | Out-File vt_report.json -Encoding UTF8
+            '# VirusTotal Summary`n`nScan skipped (no API key).' | Out-File vt_report.md -Encoding UTF8
+            exit 0
+          }
           $exePath = "dist/WoonnetRijnmondBot.exe"
           if (-not (Test-Path $exePath)) { throw "EXE not found at $exePath" }
           $hashObj = Get-FileHash -Algorithm SHA256 -Path $exePath
-          $sha256 = $hashObj.Hash.ToLower()
+            $sha256 = $hashObj.Hash.ToLower()
           $headers = @{ 'x-apikey' = "$Env:VT_API_KEY" }
           try { $report = Invoke-RestMethod -Method Get -Uri "https://www.virustotal.com/api/v3/files/$sha256" -Headers $headers -ErrorAction Stop } catch { $report = $null }
           if (-not $report) {
@@ -68,6 +77,8 @@ jobs:
           $summary = "VirusTotal scan: harmless=$($stats.harmless) undetected=$($stats.undetected) suspicious=$($stats.suspicious) malicious=$($stats.malicious) timeout=$($stats.timeout)"
           "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
           "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
+          $report | ConvertTo-Json -Depth 8 | Out-File vt_report.json -Encoding UTF8
+          "# VirusTotal Summary`n`n$summary" | Out-File vt_report.md -Encoding UTF8
 
       - name: Create GitHub Release
         id: create_release
@@ -86,7 +97,7 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Upload Release Asset
+      - name: Upload Release Asset (exe)
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,63 +106,14 @@ jobs:
           asset_path: ./dist/WoonnetRijnmondBot.exe
           asset_name: WoonnetRijnmondBot.exe
           asset_content_type: application/octet-stream
-          $sigmaSummary = if ($sigma.Count -gt 0) { $sigma | ForEach-Object { "- $($_.rule_title) ($($_.level))" } } else { @('None') }
-          # Allowlist enforcement
-          $unexpected = $flagged | Where-Object { $_.category -eq 'malicious' -and ($allowMalicious -notcontains $_.engine) }
-          if ($unexpected.Count -gt $maxUnexpectedMalicious) {
-            Write-Host "::error ::Unexpected malicious engines: $($unexpected.engine -join ', ')" 
-          }
-          # Create markdown table
-          $md = "# VirusTotal Report\n\nSHA256: $sha256\n\nSummary: $summary\n\nDetection ratio: $ratio\nReport URL: $permalink\n\n## Flagged Engines (malicious/suspicious)\n"
-          if ($flaggedCount -gt 0) {
-            $md += "| Engine | Category | Result |`n|---|---|---|`n"
-            foreach ($f in $flagged) { $md += "| $($f.engine) | $($f.category) | $($f.result) |`n" }
-          } else {
-            $md += "None flagged.\n"
-          }
-          $md += "\n## YARA Matches\n" + ($yaraSummary -join "`n") + "\n\n## Sigma Matches\n" + ($sigmaSummary -join "`n") + "\n"
-          # Save artifacts & false positives doc
-          $report | ConvertTo-Json -Depth 10 | Out-File vt_report.json -Encoding UTF8
-          $md | Out-File vt_report.md -Encoding UTF8
-          $unexpectedList = if ($unexpected.Count -gt 0) { ($unexpected.engine -join ', ') } else { 'None' }
-          $falsePos = "# FALSE_POSITIVES\n\nAllowlisted malicious engines: " + ($allowMalicious -join ', ') + "\nUnexpected malicious (should be none): $unexpectedList\n"
-          $falsePos | Out-File FALSE_POSITIVES.md -Encoding UTF8
-          # Outputs
-          "sha256=$sha256" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "summary=$summary" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "permalink=$permalink" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          "ratio=$ratio" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          if ($flaggedCount -gt 0) { "flagged_engines=$([string]::Join(',', ($flagged.engine)))" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append }
-          if ($unexpected.Count -gt 0) { "unexpected_malicious=$([string]::Join(',', ($unexpected.engine)))" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append }
 
       - name: Upload VirusTotal artifacts
-        if: steps.vt_scan.outputs.sha256
         uses: actions/upload-artifact@v4
         with:
           name: virustotal-report
           path: |
             vt_report.json
             vt_report.md
-
-  - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ github.run_number }}
-          release_name: Release ${{ github.run_number }}
-          body: |
-            Automated release for commit ${{ github.sha }}.
-            This build includes the WoonnetRijnmondBot application.
-    SHA256: ${{ steps.vt_scan.outputs.sha256 }}
-    ${% raw %}{{ steps.vt_scan.outputs.summary }}{% endraw %}
-    (If values are blank the VirusTotal step was skipped.)
-    Report: ${{ steps.vt_scan.outputs.permalink }}
-    Detection Ratio: ${{ steps.vt_scan.outputs.ratio }}
-    Flagged Engines: ${{ steps.vt_scan.outputs.flagged_engines }}
-          draft: false
-          prerelease: false
 
       - name: Archive dist folder
         shell: pwsh
